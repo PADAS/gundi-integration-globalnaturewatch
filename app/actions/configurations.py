@@ -102,6 +102,17 @@ class DatasetEntry(pydantic.BaseModel):
     def resolved_lookback_days(self, spec: DatasetSpec) -> int:
         return self.lookback_days or spec.default_lookback_days
 
+    class Config:
+        @staticmethod
+        def schema_extra(schema: dict, model) -> None:
+            # pydantic v1 emits the OpenAPI-only "discriminator" keyword for
+            # the output union. The portal's react-jsonschema-form runs ajv in
+            # strict mode, which refuses to compile schemas with unknown
+            # keywords ("strict mode: unknown keyword: discriminator"), so the
+            # config form cannot validate or save. Strip it from the emitted
+            # schema; runtime parsing still discriminates via the Field.
+            schema.get("properties", {}).get("output", {}).pop("discriminator", None)
+
 
 class PullEventsConfig(PullActionConfiguration):
     aoi_url: pydantic.HttpUrl = pydantic.Field(
