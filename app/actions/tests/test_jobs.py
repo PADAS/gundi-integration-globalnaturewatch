@@ -39,11 +39,17 @@ async def test_batch_job_submits_and_polls():
     job = BatchQueryJob(client, dataset="d", sql="SELECT ...", geostore_ids=["g1"])
     assert await job.start() == JobState.PENDING
     assert job.job_record["job_id"] == "j1"
+    assert job.job_record["job_link"] == "https://api.example.com/job/j1"
 
     client.get_job_status = AsyncMock(return_value=JobResponse.Data(
         job_id="j1", status="success", download_link="https://dl.example.com/x"))
     state, download_link, message = await job.check("https://api.example.com/job/j1")
     assert state == JobState.RESULTS_READY and download_link == "https://dl.example.com/x"
+
+    client.get_job_status = AsyncMock(return_value=JobResponse.Data(
+        job_id="j1", status="partial_success", download_link="https://dl.example.com/x"))
+    state, download_link, message = await job.check("https://api.example.com/job/j1")
+    assert state == JobState.RESULTS_READY and message == "partial_success"
 
     client.get_job_status = AsyncMock(return_value=JobResponse.Data(
         job_id="j1", status="failed", message="boom"))
