@@ -1,6 +1,7 @@
 import json
+import time
 from datetime import timedelta
-from typing import Optional
+from typing import List, Optional, Set
 
 
 class GnwState:
@@ -90,6 +91,34 @@ class GnwState:
 
     async def set_window_anchor(self, integration_id: str, entry_key: str, anchor_date_iso: str):
         await self._db.set(self._anchor_key(integration_id, entry_key), anchor_date_iso)
+
+    # --- posted-record dedup ledger (per entry) ---
+    def _posted_key(self, integration_id: str, entry_key: str) -> str:
+        return f"gnw.{integration_id}.{entry_key}.posted_fingerprints"
+
+    async def filter_new_fingerprints(self, integration_id: str, entry_key: str,
+                                      fingerprints: List[str], ttl_seconds: int) -> Set[str]:
+        """Return the subset of fingerprints not yet marked posted, pruning
+        ledger members older than ttl_seconds first."""
+        key = self._posted_key(integration_id, entry_key)
+        now = time.time()
+        await self._db.zremrangebyscore(key, "-inf", now - ttl_seconds)
+        if not fingerprints:
+            return set()
+        pipe = self._db.pipeline(transaction=False)
+        for fp in fingerprints:
+            pipe.zscore(key, fp)
+        scores = await pipe.execute()
+        return {fp for fp, score in zip(fingerprints, scores) if score is None}
+
+    async def mark_fingerprints_posted(self, integration_id: str, entry_key: str,
+                                       fingerprints) -> None:
+        fingerprints = list(fingerprints)
+        if not fingerprints:
+            return
+        key = self._posted_key(integration_id, entry_key)
+        now = time.time()
+        await self._db.zadd(key, {fp: now for fp in fingerprints})
 
     # --- dataset version status (per dataset, via template state manager) ---
     async def get_dataset_status(self, integration_id: str, dataset: str) -> Optional[dict]:

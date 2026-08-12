@@ -3,6 +3,8 @@
 Adding a strategy = one class here + one config model in the DatasetEntry
 output union + one OUTPUT_STRATEGIES entry. Handlers stay untouched.
 """
+import hashlib
+import json
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -15,6 +17,18 @@ from app.actions.configurations import DatasetEntry
 from app.actions.datasets import DatasetSpec
 
 logger = logging.getLogger(__name__)
+
+
+def row_fingerprint(row: dict) -> str:
+    """Stable identity of a fetched record for the posted-record ledger.
+
+    Hashes ALL values, so an upstream revision of a record (e.g. an
+    integrated-alerts confidence upgrade) gets a new fingerprint and is
+    posted again as an updated event — deliberate.
+    """
+    return hashlib.sha256(
+        json.dumps(row, sort_keys=True, default=str).encode()
+    ).hexdigest()[:24]
 
 
 def _recorded_at(value) -> str:

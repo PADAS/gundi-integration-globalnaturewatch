@@ -49,3 +49,43 @@ async def test_window_anchor_roundtrip(stub_state_manager):
     assert await state.get_window_anchor("int-1", "abc123") is None
     await state.set_window_anchor("int-1", "abc123", "2026-08-01")
     assert await state.get_window_anchor("int-1", "abc123") == "2026-08-01"
+
+
+@pytest.mark.asyncio
+async def test_posted_fingerprints_roundtrip(stub_state_manager):
+    state = GnwState(stub_state_manager)
+    fps = ["fp1", "fp2", "fp3"]
+    # ledger empty -> everything is new
+    assert await state.filter_new_fingerprints("int-1", "abc123", fps, ttl_seconds=3600) == set(fps)
+
+    await state.mark_fingerprints_posted("int-1", "abc123", fps)
+    # all marked -> none are new
+    assert await state.filter_new_fingerprints("int-1", "abc123", fps, ttl_seconds=3600) == set()
+
+    # a new fp among already-marked ones is still returned
+    result = await state.filter_new_fingerprints(
+        "int-1", "abc123", fps + ["fp4"], ttl_seconds=3600)
+    assert result == {"fp4"}
+
+
+@pytest.mark.asyncio
+async def test_posted_fingerprints_ttl_pruning(stub_state_manager):
+    state = GnwState(stub_state_manager)
+    fps = ["fp1", "fp2"]
+    await state.mark_fingerprints_posted("int-1", "abc123", fps)
+    assert await state.filter_new_fingerprints("int-1", "abc123", fps, ttl_seconds=3600) == set()
+
+    # age the ledger entries beyond the ttl window
+    key = state._posted_key("int-1", "abc123")
+    for fp in fps:
+        stub_state_manager._store[key][fp] -= 7200
+
+    assert await state.filter_new_fingerprints("int-1", "abc123", fps, ttl_seconds=3600) == set(fps)
+
+
+@pytest.mark.asyncio
+async def test_posted_fingerprints_empty_input_is_noop(stub_state_manager):
+    state = GnwState(stub_state_manager)
+    assert await state.filter_new_fingerprints("int-1", "abc123", [], ttl_seconds=3600) == set()
+    await state.mark_fingerprints_posted("int-1", "abc123", [])  # no-op, must not raise
+    assert state._posted_key("int-1", "abc123") not in stub_state_manager._store

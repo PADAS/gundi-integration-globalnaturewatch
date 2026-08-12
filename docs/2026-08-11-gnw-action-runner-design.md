@@ -222,13 +222,15 @@ OUTPUT_STRATEGIES = {"per_record": PerRecordStrategy(), "h3_grid": H3GridStrateg
 
 Adding a strategy later = one class + one config model in the `output` union + one registry entry; handlers and fetch logic are untouched.
 
+**Posted-record ledger and H3 counts.** Rows are filtered through the posted-record dedup ledger (see "Event semantics & dedup") *before* `to_events` runs, so `record_count` (and the min/max/mean fields) for an H3 cell reflect only the NEW, not-yet-posted rows seen in that run — not the cell's full record history. A cell whose rows have already all been posted in a prior run produces no Event at all this run.
+
 ## Event semantics & dedup
 
-No event-level external IDs (matches the old integration; Gundi/ER-side dedup is out of scope). Double-sends are bounded, not eliminated:
+No event-level external IDs (matches the old integration; Gundi/ER-side dedup is out of scope) — dedup instead happens one layer up, via the posted-record ledger described below. Double-sends are bounded, not eliminated:
 - The **dataset version gate** ensures a dataset is only re-fetched after the API reports new data.
 - **Quiet periods** pace runs per entry.
 - **Windows are half-open** (`[start, end)`), so two windows that share a boundary date never both match it — the boundary-day double-count that an inclusive-both-ends interval would produce on multi-window catch-up runs is structurally impossible.
-- **Windows re-cover the reingest margin, not just the anchor.** Each run's `start` is clamped to `end - reingest_margin_days`, so every run re-queries the dataset's ingestion-lag window even when the stored anchor is more recent. This is deliberate at-least-once: records inside the margin can be re-fetched and re-posted once per dataset-version bump within that margin, trading a bounded amount of duplication for never permanently missing data the provider ingested late (the failure mode of a strictly-advancing anchor with no margin).
+- **Windows re-cover the reingest margin, not just the anchor.** Each run's `start` is clamped to `end - reingest_margin_days`, so every run re-queries the dataset's ingestion-lag window even when the stored anchor is more recent. This still means those records are re-fetched once per dataset-version bump within the margin — but a Redis-backed posted-record ledger (per entry, sorted-set of `row_fingerprint` values with score = posting time, TTL = `reingest_margin_days + 7` days) filters out rows already posted before Events are built, so re-fetching the margin no longer means re-posting it. Net semantics: **at-most-once within the ledger TTL, at-least-once overall** — if the ledger itself is lost, behavior degrades to the old bounded-duplication tradeoff (re-post within the margin), never to permanently missing late-arriving data. Only a row whose fingerprint (a hash of *all* its field values) has genuinely changed — e.g. an integrated-alerts confidence upgrade — is treated as new and posted again, by design.
 - Batch jobs are removed from the pending set only after their results post successfully; a job that fails to post is retried on the next run, which is the same deliberate at-least-once seam (identical to the old integration).
 
 ## Error handling

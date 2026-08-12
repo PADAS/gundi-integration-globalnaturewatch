@@ -1,7 +1,7 @@
 import h3
 from app.actions.configurations import DatasetEntry, H3GridOutput
 from app.actions.datasets import DATASET_REGISTRY
-from app.actions.output import OUTPUT_STRATEGIES
+from app.actions.output import OUTPUT_STRATEGIES, row_fingerprint
 
 SPEC = DATASET_REGISTRY["nasa_viirs_fire_alerts"]
 
@@ -51,3 +51,15 @@ def test_h3_grid_buckets_and_aggregates():
 def test_h3_grid_empty_rows():
     entry = DatasetEntry(dataset="nasa_viirs_fire_alerts", output=H3GridOutput())
     assert OUTPUT_STRATEGIES["h3_grid"].to_events([], entry, SPEC) == []
+
+
+def test_row_fingerprint_stable_and_order_insensitive():
+    row = {"a": 1, "b": "x", "c": 2.5}
+    reordered = {"c": 2.5, "a": 1, "b": "x"}
+    assert row_fingerprint(row) == row_fingerprint(reordered)
+
+
+def test_row_fingerprint_changes_on_value_change():
+    base = {"a": 1, "confidence__cat": "n"}
+    upgraded = {"a": 1, "confidence__cat": "h"}
+    assert row_fingerprint(base) != row_fingerprint(upgraded)

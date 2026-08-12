@@ -93,6 +93,74 @@ async def test_run_query_job_sync_no_anchor_advance_when_noncontiguous(mocker, h
 
 
 @pytest.mark.asyncio
+async def test_post_rows_dedups_repeat_posts(mocker, handler_env):
+    """The same row posted twice through _post_rows must only reach Gundi once."""
+    handlers, send, state_stub, integration = handler_env
+    from app.actions.configurations import DatasetEntry
+    from app.actions.datasets import DATASET_REGISTRY
+    entry = DatasetEntry(dataset="nasa_viirs_fire_alerts")
+    spec = DATASET_REGISTRY["nasa_viirs_fire_alerts"]
+    rows = [{"latitude": 1.0, "longitude": 2.0, "alert__date": "2026-08-05",
+             "confidence__cat": "h", "frp__MW": 3.0}]
+
+    first = await handlers._post_rows(rows, entry, spec, str(integration.id))
+    assert first == 1
+    assert send.await_count == 1
+
+    send.reset_mock()
+    second = await handlers._post_rows(rows, entry, spec, str(integration.id))
+    assert second == 0
+    send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_rows_failed_send_leaves_rows_retryable(mocker, handler_env):
+    handlers, send, state_stub, integration = handler_env
+    from app.actions.configurations import DatasetEntry
+    from app.actions.datasets import DATASET_REGISTRY
+    entry = DatasetEntry(dataset="nasa_viirs_fire_alerts")
+    spec = DATASET_REGISTRY["nasa_viirs_fire_alerts"]
+    rows = [{"latitude": 1.0, "longitude": 2.0, "alert__date": "2026-08-05",
+             "confidence__cat": "h", "frp__MW": 3.0}]
+
+    send.side_effect = Exception("gundi is down")
+    with pytest.raises(Exception, match="gundi is down"):
+        await handlers._post_rows(rows, entry, spec, str(integration.id))
+
+    send.side_effect = None
+    send.reset_mock()
+    result = await handlers._post_rows(rows, entry, spec, str(integration.id))
+    assert result == 1
+    assert send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_post_rows_h3_counts_new_rows_only(mocker, handler_env):
+    handlers, send, state_stub, integration = handler_env
+    from app.actions.configurations import DatasetEntry, H3GridOutput
+    from app.actions.datasets import DATASET_REGISTRY
+    entry = DatasetEntry(dataset="nasa_viirs_fire_alerts", output=H3GridOutput(resolution=7))
+    spec = DATASET_REGISTRY["nasa_viirs_fire_alerts"]
+    row_a = {"latitude": 1.0, "longitude": 2.0, "alert__date": "2026-08-05",
+             "confidence__cat": "h", "frp__MW": 3.0}
+    row_b = {"latitude": 1.0001, "longitude": 2.0001, "alert__date": "2026-08-05",
+             "confidence__cat": "h", "frp__MW": 4.0}
+    row_c = {"latitude": 1.0002, "longitude": 2.0002, "alert__date": "2026-08-06",
+             "confidence__cat": "n", "frp__MW": 5.0}
+
+    first = await handlers._post_rows([row_a, row_b], entry, spec, str(integration.id))
+    assert first == 1
+    posted = send.call_args.kwargs["events"]
+    assert posted[0]["event_details"]["record_count"] == 2
+
+    send.reset_mock()
+    second = await handlers._post_rows([row_a, row_b, row_c], entry, spec, str(integration.id))
+    assert second == 1
+    posted = send.call_args.kwargs["events"]
+    assert posted[0]["event_details"]["record_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_run_query_job_batch_submits_and_persists(mocker, handler_env):
     handlers, send, state_stub, integration = handler_env
     mocker.patch.object(DataAPI, "query_batch", AsyncMock(return_value=JobResponse.Data(

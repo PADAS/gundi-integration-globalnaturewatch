@@ -17,7 +17,7 @@ from app.actions.gnwclient import (
     AOIData, DataAPI, DataAPIAuthException, DatasetStatus, DownloadLinkExpiredException,
 )
 from app.actions.jobs import BatchQueryJob, JobState, SyncQueryJob, generate_windows
-from app.actions.output import OUTPUT_STRATEGIES
+from app.actions.output import OUTPUT_STRATEGIES, row_fingerprint
 from app.actions.sqlbuilder import ConfigValidationError, build_query
 from app.actions.state import GnwState
 from app.services.action_scheduler import crontab_schedule, trigger_action
@@ -67,11 +67,23 @@ async def action_list_dataset_fields(integration, action_config: ListDatasetFiel
 
 
 async def _post_rows(rows, entry, spec, integration_id) -> int:
-    """Shared funnel: rows from any query path -> output strategy -> Gundi Events."""
+    """Filter already-posted rows through the dedup ledger, post the rest.
+
+    Marking happens only AFTER a successful post: a failed send leaves the
+    rows unmarked so the next run retries them (at-least-once)."""
+    key = entry_state_key(entry)
+    ttl_seconds = (spec.reingest_margin_days + 7) * 86400
+    rows_by_fp = {row_fingerprint(row): row for row in rows}  # identical rows collapse — they ARE duplicates
+    new_fps = await gnw_state.filter_new_fingerprints(
+        integration_id, key, list(rows_by_fp), ttl_seconds)
+    new_rows = [row for fp, row in rows_by_fp.items() if fp in new_fps]
+    if not new_rows:
+        return 0
     strategy = OUTPUT_STRATEGIES[entry.output.mode]
-    events = strategy.to_events(rows, entry, spec)
+    events = strategy.to_events(new_rows, entry, spec)
     if events:
         await send_events_to_gundi(events=events, integration_id=integration_id)
+    await gnw_state.mark_fingerprints_posted(integration_id, key, new_fps)
     return len(events)
 
 
