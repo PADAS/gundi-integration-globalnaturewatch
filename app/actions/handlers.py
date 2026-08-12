@@ -1,20 +1,27 @@
 import asyncio
 import logging
 import random
-from datetime import timedelta
+from datetime import date, datetime, timedelta, timezone
+
+import httpx
+import pydantic
 
 import app.settings
 from app.actions.configurations import (
-    ListDatasetsQuery, ListDatasetFieldsQuery, RunQueryJobConfig, entry_state_key, get_auth_config,
+    AuthenticateConfig, ListDatasetsQuery, ListDatasetFieldsQuery, PullEventsConfig,
+    RunQueryJobConfig, entry_state_key, get_auth_config,
 )
 from app.actions.core import ReferenceDataResponse, ReferenceOption
 from app.actions.datasets import DATASET_REGISTRY, QueryMode
-from app.actions.gnwclient import DataAPI, DownloadLinkExpiredException
-from app.actions.jobs import BatchQueryJob, JobState, SyncQueryJob
+from app.actions.gnwclient import (
+    AOIData, DataAPI, DataAPIAuthException, DatasetStatus, DownloadLinkExpiredException,
+)
+from app.actions.jobs import BatchQueryJob, JobState, SyncQueryJob, generate_windows
 from app.actions.output import OUTPUT_STRATEGIES
-from app.actions.sqlbuilder import build_query
+from app.actions.sqlbuilder import ConfigValidationError, build_query
 from app.actions.state import GnwState
-from app.services.activity_logger import log_action_activity
+from app.services.action_scheduler import crontab_schedule, trigger_action
+from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.gundi import send_events_to_gundi
 from app.services.state import IntegrationStateManager
 from gundi_core.schemas.v2 import Integration, LogLevel
@@ -200,3 +207,141 @@ async def action_run_query_job(integration: Integration, action_config: RunQuery
         quiet_minutes = random.randint(30, 60)
     await gnw_state.set_quiet_period(integration_id, key, timedelta(minutes=quiet_minutes))
     return result
+
+
+async def action_auth(integration, action_config: AuthenticateConfig):
+    """Validate a user-supplied email/password against the GFW Data API."""
+    try:
+        client = DataAPI(username=action_config.email,
+                         password=action_config.password.get_secret_value())
+        token = await client.get_access_token()
+    except (DataAPIAuthException, httpx.HTTPError) as e:
+        return {"valid_credentials": False,
+                "message": f"Failed to authenticate with the GFW Data API: {e}"}
+    return {"valid_credentials": token is not None}
+
+
+@activity_logger()
+@crontab_schedule("*/10 * * * *")
+async def action_pull_events(integration: Integration, action_config: PullEventsConfig):
+    """Scheduled orchestrator: resolve the AOI once, then for each configured
+    dataset entry validate config, respect quiet periods/version gates, and
+    trigger `run_query_job` (Task 14) for the windows that still need data.
+    Per-entry isolation: one bad entry never stops the others from running."""
+    integration_id = str(integration.id)
+    result = {"triggered": [], "skipped": [], "errors": []}
+    auth = get_auth_config(integration)
+    client = DataAPI(username=auth.email, password=auth.password.get_secret_value())
+
+    # --- AOI: cached-first, live fallback, cache on success ---
+    cached = await gnw_state.get_aoi_data(integration_id)
+    if cached:
+        aoi_data = AOIData.parse_obj(cached)
+    else:
+        try:
+            aoi_id = await client.aoi_from_url(str(action_config.aoi_url))
+            aoi_data = await client.get_aoi(aoi_id=aoi_id)
+            await gnw_state.set_aoi_data(integration_id, aoi_data.dict())
+        except Exception as e:
+            msg = f"Failed to resolve AOI from {action_config.aoi_url}: {e}"
+            await log_action_activity(integration_id=integration.id, action_id="pull_events",
+                                      level=LogLevel.ERROR, title=msg, data={"error": str(e)})
+            result["errors"].append(msg)
+            return result
+    if not aoi_data.attributes.geostore:
+        msg = f"No Geostore associated with AOI {aoi_data.id}."
+        await log_action_activity(integration_id=integration.id, action_id="pull_events",
+                                  level=LogLevel.ERROR, title=msg, data={"aoi_id": aoi_data.id})
+        result["errors"].append(msg)
+        return result
+    geostore_ids = [aoi_data.attributes.geostore]
+
+    for index, entry in enumerate(action_config.dataset_entries):
+        label = f"entry[{index}]:{entry.dataset}"
+        try:
+            spec = DATASET_REGISTRY.get(entry.dataset)
+            if spec is None:
+                raise ConfigValidationError(
+                    [f"Dataset '{entry.dataset}' is not offered. Available: {sorted(DATASET_REGISTRY)}"])
+            key = entry_state_key(entry)
+
+            # validate fields/filters against live inventory (build once, discard)
+            dataset_fields = await client.get_dataset_fields(dataset=entry.dataset)
+            probe_day = datetime.now(tz=timezone.utc).date()
+            build_query(spec=spec, extra_fields=entry.fields,
+                        filters=[f.dict() for f in entry.filters],
+                        window_start=probe_day, window_end=probe_day,
+                        dataset_fields=dataset_fields)
+
+            # batch entries with pending jobs always poll (download links expire)
+            if spec.query_mode == QueryMode.BATCH:
+                if await gnw_state.get_pending_jobs(integration_id, key):
+                    end = _next_midnight_utc()
+                    start = end - timedelta(days=entry.resolved_lookback_days(spec))
+                    await trigger_action(integration.id, "run_query_job", config=RunQueryJobConfig(
+                        entry=entry, geostore_ids=geostore_ids,
+                        window_start=start.date(), window_end=end.date(), submit_new=False))
+                    result["triggered"].append(f"{label} (polling jobs)")
+                    continue
+
+            if not action_config.force_fetch and await gnw_state.is_quiet_period(integration_id, key):
+                result["skipped"].append(f"{label} (quiet period)")
+                continue
+
+            # version gate (per dataset)
+            metadata = await client.get_dataset_metadata(entry.dataset)
+            stored = await gnw_state.get_dataset_status(integration_id, entry.dataset)
+            if stored and not action_config.force_fetch:
+                try:
+                    status = DatasetStatus.parse_obj(stored)
+                    if status.latest_updated_on >= metadata.updated_on:
+                        await gnw_state.set_quiet_period(
+                            integration_id, key, timedelta(minutes=random.randint(30, 60)))
+                        result["skipped"].append(f"{label} (no dataset updates)")
+                        continue
+                except pydantic.ValidationError:
+                    logger.warning(f"Discarding invalid stored dataset status for {entry.dataset}")
+
+            # window: anchor-first
+            end = _next_midnight_utc().date()
+            lookback_start = end - timedelta(days=entry.resolved_lookback_days(spec))
+            anchor = await gnw_state.get_window_anchor(integration_id, key)
+            start = max(date.fromisoformat(anchor), lookback_start) if anchor else lookback_start
+            if start >= end:
+                result["skipped"].append(f"{label} (window empty)")
+                continue
+
+            if spec.query_mode == QueryMode.SYNC:
+                for window_start, window_end in generate_windows(start, end, interval_days=7):
+                    await trigger_action(integration.id, "run_query_job", config=RunQueryJobConfig(
+                        entry=entry, geostore_ids=geostore_ids,
+                        window_start=window_start, window_end=window_end))
+            else:
+                await trigger_action(integration.id, "run_query_job", config=RunQueryJobConfig(
+                    entry=entry, geostore_ids=geostore_ids,
+                    window_start=start, window_end=end, submit_new=True))
+            result["triggered"].append(label)
+
+            await gnw_state.set_dataset_status(integration_id, entry.dataset, DatasetStatus(
+                dataset=metadata.dataset, version=metadata.version,
+                latest_updated_on=metadata.updated_on,
+            ).dict())
+
+        except ConfigValidationError as e:
+            msg = f"{label}: invalid configuration — {e}"
+            await log_action_activity(integration_id=integration.id, action_id="pull_events",
+                                      level=LogLevel.WARNING, title=msg, data={"errors": e.errors})
+            result["errors"].append(msg)
+        except Exception as e:
+            msg = f"{label}: failed — {e}"
+            logger.exception(msg)
+            await log_action_activity(integration_id=integration.id, action_id="pull_events",
+                                      level=LogLevel.WARNING, title=msg, data={"error": str(e)})
+            result["errors"].append(msg)
+
+    return result
+
+
+def _next_midnight_utc() -> datetime:
+    return (datetime.now(tz=timezone.utc) + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)

@@ -240,3 +240,119 @@ async def test_run_query_job_batch_still_pending_sets_zero_minute_quiet_tier(moc
     assert result["jobs_pending"] == 1
     # jobs_pending > 0 -> 0-minute quiet tier, i.e. set_quiet_period is a no-op.
     assert not await handlers.gnw_state.is_quiet_period(str(integration.id), key)
+
+
+def make_aoi_dict(geostore="geo-1"):
+    return {"type": "area", "id": "aoi-1", "attributes": {
+        "name": "A", "application": "gfw", "geostore": geostore,
+        "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+        "use": {}, "env": "production", "tags": [], "status": "saved", "public": True}}
+
+
+@pytest.fixture
+def orchestrator_env(mocker, handler_env):
+    handlers, send, state_stub, integration = handler_env
+    # activity_logger() publishes IntegrationActionStarted/Complete/Failed events over
+    # real GCP PubSub; stub it out so the orchestrator tests stay hermetic and fast.
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+    trigger = mocker.patch.object(handlers, "trigger_action", AsyncMock())
+    mocker.patch.object(DataAPI, "get_dataset_metadata", AsyncMock(
+        return_value=__import__("app.actions.gnwclient", fromlist=["DatasetResponseItem"]).DatasetResponseItem(
+            created_on="2026-08-01T00:00:00Z", updated_on="2026-08-09T00:00:00Z",
+            dataset="nasa_viirs_fire_alerts", version="v20260809", is_latest=True, is_mutable=True)))
+    return handlers, trigger, state_stub, integration
+
+
+@pytest.mark.asyncio
+async def test_pull_events_uses_cached_aoi_and_triggers_sync_windows(mocker, orchestrator_env):
+    handlers, trigger, state_stub, integration = orchestrator_env
+    await handlers.gnw_state.set_aoi_data(str(integration.id), make_aoi_dict())
+    from app.actions.configurations import PullEventsConfig
+    config = PullEventsConfig.parse_obj({
+        "aoi_url": "https://www.globalnaturewatch.org/dashboards/aoi/abc/",
+        "dataset_entries": [{"dataset": "nasa_viirs_fire_alerts", "lookback_days": 10}]})
+    result = await handlers.action_pull_events(integration, config)
+    assert result["errors"] == []
+    assert trigger.await_count == 2  # 10-day lookback -> two 7-day windows
+    called_action = trigger.call_args.args[1]
+    assert called_action == "run_query_job"
+
+
+@pytest.mark.asyncio
+async def test_pull_events_skips_on_quiet_period(mocker, orchestrator_env):
+    handlers, trigger, state_stub, integration = orchestrator_env
+    await handlers.gnw_state.set_aoi_data(str(integration.id), make_aoi_dict())
+    from app.actions.configurations import DatasetEntry, PullEventsConfig, entry_state_key
+    from datetime import timedelta
+    entry = DatasetEntry(dataset="nasa_viirs_fire_alerts")
+    await handlers.gnw_state.set_quiet_period(str(integration.id), entry_state_key(entry), timedelta(minutes=30))
+    config = PullEventsConfig.parse_obj({
+        "aoi_url": "https://www.globalnaturewatch.org/dashboards/aoi/abc/",
+        "dataset_entries": [{"dataset": "nasa_viirs_fire_alerts"}]})
+    result = await handlers.action_pull_events(integration, config)
+    assert trigger.await_count == 0
+    assert len(result["skipped"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_pull_events_version_gate_skips(mocker, orchestrator_env):
+    handlers, trigger, state_stub, integration = orchestrator_env
+    await handlers.gnw_state.set_aoi_data(str(integration.id), make_aoi_dict())
+    state_stub.get_state = AsyncMock(return_value={
+        "dataset": "nasa_viirs_fire_alerts", "version": "v20260809",
+        "latest_updated_on": "2026-08-09T00:00:00+00:00"})
+    from app.actions.configurations import PullEventsConfig
+    config = PullEventsConfig.parse_obj({
+        "aoi_url": "https://www.globalnaturewatch.org/dashboards/aoi/abc/",
+        "dataset_entries": [{"dataset": "nasa_viirs_fire_alerts"}]})
+    result = await handlers.action_pull_events(integration, config)
+    assert trigger.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_pull_events_bad_entry_isolated(mocker, orchestrator_env):
+    handlers, trigger, state_stub, integration = orchestrator_env
+    await handlers.gnw_state.set_aoi_data(str(integration.id), make_aoi_dict())
+    from app.actions.configurations import PullEventsConfig
+    config = PullEventsConfig.parse_obj({
+        "aoi_url": "https://www.globalnaturewatch.org/dashboards/aoi/abc/",
+        "dataset_entries": [
+            {"dataset": "not_in_registry"},
+            {"dataset": "nasa_viirs_fire_alerts", "filters": [
+                {"field": "no_such_field", "operator": "=", "value": "x"}]},
+            {"dataset": "nasa_viirs_fire_alerts"},
+        ]})
+    result = await handlers.action_pull_events(integration, config)
+    assert len(result["errors"]) == 2       # first two entries
+    assert trigger.await_count >= 1          # third entry still ran
+
+
+@pytest.mark.asyncio
+async def test_pull_events_batch_pending_jobs_bypass_quiet(mocker, orchestrator_env):
+    handlers, trigger, state_stub, integration = orchestrator_env
+    await handlers.gnw_state.set_aoi_data(str(integration.id), make_aoi_dict())
+    from app.actions.configurations import DatasetEntry, PullEventsConfig, entry_state_key
+    from datetime import timedelta
+    entry = DatasetEntry(dataset="gfw_integrated_alerts")
+    key = entry_state_key(entry)
+    await handlers.gnw_state.set_quiet_period(str(integration.id), key, timedelta(minutes=60))
+    await handlers.gnw_state.add_pending_job(str(integration.id), key,
+                                             {"job_id": "j1", "job_link": "https://x/j1"})
+    config = PullEventsConfig.parse_obj({
+        "aoi_url": "https://www.globalnaturewatch.org/dashboards/aoi/abc/",
+        "dataset_entries": [{"dataset": "gfw_integrated_alerts"}]})
+    await handlers.action_pull_events(integration, config)
+    assert trigger.await_count == 1
+    sub_config = trigger.call_args.kwargs["config"]
+    assert sub_config.submit_new is False
+
+
+@pytest.mark.asyncio
+async def test_action_auth_validates_credentials(mocker, integration_v2_like):
+    import app.actions.handlers as handlers
+    from app.actions.configurations import AuthenticateConfig
+    import pydantic
+    mocker.patch.object(DataAPI, "get_access_token", AsyncMock(return_value=MagicMock()))
+    config = AuthenticateConfig(email="u@example.com", password=pydantic.SecretStr("pw"))
+    result = await handlers.action_auth(integration_v2_like, config)
+    assert result == {"valid_credentials": True}
