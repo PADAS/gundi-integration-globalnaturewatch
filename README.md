@@ -1,5 +1,5 @@
-# gundi-integration-action-runner
-Template repo for integration in Gundi v2.
+# gundi-integration-globalnaturewatch
+Gundi v2 integration for Global Nature Watch — pulls curated GFW Data API datasets into Gundi Events. (Replaces gundi-integration-gfw.)
 
 ## Usage
 - Fork this repo
