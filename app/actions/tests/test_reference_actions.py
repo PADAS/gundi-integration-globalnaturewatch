@@ -100,3 +100,31 @@ def test_list_field_values_unknown_dataset_fails_validation():
     from app.actions.configurations import ListFieldValuesQuery
     with pytest.raises(pydantic.ValidationError):
         ListFieldValuesQuery(dataset="not_a_dataset", field="whatever")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_field_values_dedups_repeated_meanings():
+    """Fields like land-cover classes map several raster values to one
+    meaning; the dropdown must offer each meaning once (first value wins)."""
+    from app.actions.handlers import action_list_field_values
+    from app.actions.configurations import ListFieldValuesQuery
+    respx.get(f"{DataAPI.DATA_API_URL}/dataset/gfw_integrated_alerts/latest/fields").respond(
+        json={"data": [
+            {"pixel_meaning": "landcover__class", "unit": None, "description": None,
+             "statistics": None, "compression": None, "no_data_value": None, "data_type": None,
+             "values_table": {"rows": [
+                 {"value": 1, "meaning": "Primary forest"},
+                 {"value": 2, "meaning": "Primary forest"},
+                 {"value": 3, "meaning": "Cropland"},
+             ]}},
+        ]}
+    )
+    result = await action_list_field_values(
+        integration=None,
+        action_config=ListFieldValuesQuery(dataset="gfw_integrated_alerts", field="landcover__class"),
+    )
+    assert [(o["value"], o["description"]) for o in result["options"]] == [
+        ("Primary forest", "raster value 1"),
+        ("Cropland", "raster value 3"),
+    ]

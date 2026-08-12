@@ -77,12 +77,20 @@ async def action_list_field_values(integration, action_config: ListFieldValuesQu
     match = next((f for f in fields if f.name == action_config.field), None)
     rows = (match.values_table or {}).get("rows") if match else None
     if rows:
+        # Dedup by meaning, first raster value wins: some fields map several
+        # raster values to one meaning (e.g. land-cover classes), and the SQL
+        # filter compares against the meaning string.
+        by_meaning = {}
+        for row in rows:
+            meaning = row.get("meaning")
+            if meaning and str(meaning) not in by_meaning:
+                by_meaning[str(meaning)] = row.get("value")
         options = [
             ReferenceOption(
-                value=str(row["meaning"]), label=str(row["meaning"]),
-                description=f"raster value {row.get('value')}",
+                value=meaning, label=meaning,
+                description=f"raster value {raster_value}" if raster_value is not None else None,
             )
-            for row in rows if row.get("meaning")
+            for meaning, raster_value in by_meaning.items()
         ]
     else:
         curated = DATASET_REGISTRY[action_config.dataset].field_values.get(
