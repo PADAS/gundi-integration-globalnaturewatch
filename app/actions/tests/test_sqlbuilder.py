@@ -113,3 +113,40 @@ def test_multiple_bad_filters_accumulate_errors():
             {"field": "frp__MW", "operator": ">", "value": "5; DROP TABLE"},
         ], window_start=WINDOW[0], window_end=WINDOW[1], dataset_fields=FIELDS)
     assert len(exc.value.errors) == 2
+
+
+def test_backslash_rejected_in_text_value():
+    with pytest.raises(ConfigValidationError):
+        render_literal("foo\\bar", "text")
+
+
+def test_backslash_rejected_in_unknown_type_value():
+    with pytest.raises(ConfigValidationError):
+        render_literal("foo\\bar", None)
+
+
+def test_date_injection_via_trailing_junk_rejected():
+    with pytest.raises(ConfigValidationError):
+        render_literal("2026-08-01' OR '1'='1", "date")
+
+
+def test_date_still_renders_plain_iso_date():
+    assert render_literal("2026-08-01", "date") == "'2026-08-01'"
+
+
+def test_numeric_non_finite_values_rejected():
+    for bad in ("NaN", "Infinity", "1e309"):
+        with pytest.raises(ConfigValidationError):
+            render_literal(bad, "numeric")
+
+
+def test_numeric_underscore_separator_canonicalized():
+    assert render_literal("1_000", "numeric") == "1000"
+
+
+def test_numeric_still_renders_plain_float():
+    assert render_literal("5.5", "numeric") == "5.5"
+
+
+def test_render_literal_unknown_type_non_finite_falls_to_quoting():
+    assert render_literal("NaN", None) == "'NaN'"

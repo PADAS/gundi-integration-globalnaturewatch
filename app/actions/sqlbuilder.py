@@ -2,9 +2,12 @@
 
 Identifiers are allowlisted against the dataset's live /fields inventory;
 values are parsed to the field's data_type and rendered as typed literals.
-No user-supplied string is ever interpolated unvalidated.
+No user-supplied string is ever interpolated unvalidated. String literals
+use ANSI single-quote-doubling (`'` -> `''`); backslashes are rejected
+outright rather than guessing the backend's escaping conventions.
 """
 import datetime
+import math
 from typing import List, Optional
 
 from app.actions.datasets import DatasetSpec
@@ -29,33 +32,47 @@ def _quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _canonical_number(value: str):
+    try:
+        return str(int(value))
+    except ValueError:
+        pass
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return repr(parsed)
+
+
 def render_literal(value: str, data_type: Optional[str]) -> str:
     value = value.strip()
+    if "\\" in value:
+        raise ConfigValidationError(["Backslash is not allowed in filter values"])
     if data_type in NUMERIC_TYPES:
-        try:
-            float(value)
-        except ValueError:
+        num = _canonical_number(value)
+        if num is None:
             raise ConfigValidationError([f"'{value}' is not a valid number"])
-        return value
+        return num
     if data_type in BOOLEAN_TYPES:
         if value.lower() not in ("true", "false"):
             raise ConfigValidationError([f"'{value}' is not a valid boolean"])
         return value.upper()
     if data_type in DATE_TYPES:
         try:
-            datetime.date.fromisoformat(value[:10])
+            parsed_date = datetime.date.fromisoformat(value)
         except ValueError:
             raise ConfigValidationError([f"'{value}' is not a valid ISO date"])
-        return _quote(value)
+        return _quote(parsed_date.isoformat())
     if data_type is None or data_type not in TEXT_TYPES:
         # Unknown type metadata (raster datasets report data_type=null):
         # values that parse as numbers render as numbers, everything else
         # is quoted and escaped. Parsed output only — never raw input.
-        try:
-            float(value)
-            return value
-        except ValueError:
-            return _quote(value)
+        num = _canonical_number(value)
+        if num is not None:
+            return num
+        return _quote(value)
     return _quote(value)
 
 
