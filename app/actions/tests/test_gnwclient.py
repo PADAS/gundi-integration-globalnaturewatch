@@ -184,3 +184,19 @@ def test_dataset_field_normalizes_raster_shape():
                                      "data_type": "numeric", "unit": "MW",
                                      "is_feature_info": True, "is_filter": True})
     assert vector.name == "frp__MW" and vector.data_type == "numeric"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_aoi_malformed_payload_raises_client_exception():
+    """A payload that fails model validation must surface GFWClientException
+    (with the raw body logged), not an AttributeError from logging .text on
+    the decoded dict (Copilot review round 2)."""
+    from app.actions.gnwclient import GFWClientException
+    respx.post(f"{DataAPI.DATA_API_URL}/auth/token").respond(json=TOKEN_PAYLOAD)
+    respx.get(f"{DataAPI.RESOURCE_WATCH_URL}/v2/area/bad-aoi").respond(
+        json={"data": {"unexpected": "shape"}}
+    )
+    client = DataAPI(username="u", password="p")
+    with pytest.raises(GFWClientException):
+        await client.get_aoi(aoi_id="bad-aoi")

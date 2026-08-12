@@ -446,10 +446,10 @@ class DataAPI:
                 follow_redirects=True
             )
             response.raise_for_status()
-            response = response.json()
+            payload = response.json()
 
             try:
-                return AOIData.parse_obj(response.get("data"))
+                return AOIData.parse_obj(payload.get("data"))
             except pydantic.ValidationError as e:
                 logger.exception(f"Unexpected error parsing AOI data: {e}")
 
@@ -469,10 +469,10 @@ class DataAPI:
                 headers=await self.get_auth_header()
             )
             response.raise_for_status()
-            response = response.json()
+            payload = response.json()
 
             try:
-                return Geostore.parse_obj(response.get("data"))
+                return Geostore.parse_obj(payload.get("data"))
             except pydantic.ValidationError as e:
                 logger.exception(f"Unexpected error parsing Geostore data: {e}")
 
