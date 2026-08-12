@@ -82,8 +82,11 @@ def test_render_literal_unknown_type_parses_or_quotes():
 
 
 def test_filter_on_raster_field_with_null_data_type():
-    fields = make_fields(("latitude", "numeric", False), ("longitude", "numeric", False),
-                         ("alert__date", "date", True)) + [
+    fields = make_fields(
+        ("latitude", "numeric", False), ("longitude", "numeric", False),
+        ("alert__date", "date", True), ("confidence__cat", "text", True),
+        ("frp__MW", "numeric", True),
+    ) + [
         DatasetField.parse_obj({"pixel_meaning": "gfw_integrated_alerts__confidence", "unit": None,
                                 "description": None, "statistics": None, "values_table": None,
                                 "data_type": None, "compression": None, "no_data_value": None})]
@@ -91,6 +94,16 @@ def test_filter_on_raster_field_with_null_data_type():
         {"field": "gfw_integrated_alerts__confidence", "operator": "=", "value": "high"}],
         window_start=WINDOW[0], window_end=WINDOW[1], dataset_fields=fields)
     assert "gfw_integrated_alerts__confidence = 'high'" in sql
+
+
+def test_missing_spec_default_field_rejected():
+    fields = make_fields(("latitude", "numeric", False), ("longitude", "numeric", False),
+                         ("alert__date", "date", True), ("confidence__cat", "text", True))
+    # frp__MW (a spec default) is absent from the dataset's live inventory
+    with pytest.raises(ConfigValidationError) as exc:
+        build_query(spec=VIIRS_SPEC, extra_fields=[], filters=[],
+                    window_start=WINDOW[0], window_end=WINDOW[1], dataset_fields=fields)
+    assert "frp__MW" in str(exc.value)
 
 
 def test_multiple_bad_filters_accumulate_errors():

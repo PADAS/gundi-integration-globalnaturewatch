@@ -69,10 +69,7 @@ def build_query(*, spec: DatasetSpec, extra_fields: List[str], filters: List[dic
     for name in [*spec.default_fields, *extra_fields]:
         if name not in select_fields:
             select_fields.append(name)
-    # spec.default_fields/lat_field/lon_field/date_field are curated in code
-    # (Task 7), not user input, so only user-supplied extra_fields are
-    # allowlisted against the dataset's live /fields inventory here.
-    for name in extra_fields:
+    for name in select_fields:
         if name not in by_name:
             errors.append(f"Unknown field '{name}' for dataset '{spec.title}'")
 
