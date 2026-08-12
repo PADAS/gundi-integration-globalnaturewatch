@@ -81,8 +81,11 @@ async def _post_rows(rows, entry, spec, integration_id) -> int:
         return 0
     strategy = OUTPUT_STRATEGIES[entry.output.mode]
     events = strategy.to_events(new_rows, entry, spec)
-    if events:
-        await send_events_to_gundi(events=events, integration_id=integration_id)
+    if not events:
+        # No events emitted for these rows — do NOT mark them, or a future
+        # row-dropping strategy would silently lose records forever.
+        return 0
+    await send_events_to_gundi(events=events, integration_id=integration_id)
     await gnw_state.mark_fingerprints_posted(integration_id, key, new_fps)
     return len(events)
 
