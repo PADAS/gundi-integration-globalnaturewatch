@@ -6,6 +6,7 @@ def test_discover_actions_finds_expected_handlers():
     handlers = discover_actions(module_name="app.actions.handlers", prefix="action_")
     assert set(handlers) == {
         "auth", "pull_events", "run_query_job", "list_datasets", "list_dataset_fields",
+        "list_field_values",
     }
 
 

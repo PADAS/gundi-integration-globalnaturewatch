@@ -88,15 +88,16 @@ Each entry's queried window is `[start, end)` — half-open, so a shared boundar
 
 The effective `start` is persisted as the new anchor *before* any sub-action runs, and `action_run_query_job` only advances the anchor when the window it just finished started exactly at that stored anchor — so a failed or out-of-order slice is safely re-covered next run instead of silently skipped. The tradeoff: records within the reingest margin are re-queried on every run that opens a new dataset version — but a Redis-backed posted-record ledger (per entry, TTL = `reingest_margin_days + 7` days) filters out rows already posted before Events are built, so re-querying the margin no longer means re-posting it. Duplicates in EarthRanger now occur only if the ledger itself is lost (e.g. a Redis flush) or two runs for the same entry race the filter→post→mark check-then-act concurrently (batch polling overlapping a redelivered at-least-once trigger), both of which degrade to today's bounded re-posts rather than ever losing data — at-most-once within the ledger TTL under normal operation, at-least-once overall (never exactly-once). See the design doc's "Event semantics & dedup" section for the ledger's fingerprinting rules (including that two genuinely distinct records identical on every selected field collapse to one post) and the H3-aggregate count implication (`record_count` reflects only new, not-yet-posted records for that run).
 
-**Reference actions** (`action_list_datasets`, `action_list_dataset_fields`) are also not portal-configurable in the usual sense — see below.
+**Reference actions** (`action_list_datasets`, `action_list_dataset_fields`, `action_list_field_values`) are also not portal-configurable in the usual sense — see below.
 
 ## Reference actions & dynamic dropdowns
 
-The dataset picker and field pickers *want* to be portal dropdowns backed by live data, using the reference-actions mechanism vendored from `gundi-integration-cmore` (`ReferenceActionConfiguration`, `gundi:reference` UI annotations, `$data`-bound params). `PullEventsConfig.ui_schema()` wires:
+The dataset picker, field pickers, and filter-value picker *want* to be portal dropdowns backed by live data, using the reference-actions mechanism vendored from `gundi-integration-cmore` (`ReferenceActionConfiguration`, `gundi:reference` UI annotations, `$data`-bound params). `PullEventsConfig.ui_schema()` wires:
 
 - `dataset_entries[].dataset` → `list_datasets` (no params)
 - `dataset_entries[].fields[]` → `list_dataset_fields`, `dataset` bound via `$data` to the sibling entry's `dataset`
 - `dataset_entries[].filters[].field` → `list_dataset_fields` with `filterable_only: true`
+- `dataset_entries[].filters[].value` → `list_field_values`, `dataset` bound via `$data` and `field` bound to its bare sibling in the same filter row. Values come from the field's live `values_table` (raster datasets enumerate values natively) or, failing that, a curated `DatasetSpec.field_values` map (vector datasets don't enumerate); unknown/non-enumerable fields return no options and the field stays free text.
 
 **The Gundi portal does not support the `"reference"` action type yet** (Phase 1 of the cmore RFC is unbuilt). Until it lands:
 - These fields render as plain free-text inputs (`allow_free_text: true` is always set) — users type dataset keys and field names directly, and get validated at runtime with clear activity-log errors on mistakes.
@@ -110,7 +111,7 @@ A drift-guard test (`test_gundi_reference_annotations_match_registered_reference
 |---|---|---|
 | `INTEGRATION_TYPE_NAME` | `Global Nature Watch` | Integration type name shown in the portal |
 | `GNW_DATASET_QUERY_CONCURRENCY` | `5` | Caps concurrent requests to the GFW Data API per instance (module-level `asyncio.Semaphore` in `app/actions/handlers.py`). The API's practical ceiling is ~50 concurrent requests across all instances — size this against instance count. |
-| `REGISTER_REFERENCE_ACTIONS` | `False` | Whether to self-register `list_datasets`/`list_dataset_fields` as `"reference"`-type actions with Gundi. Leave off until the portal supports that action type (see above). |
+| `REGISTER_REFERENCE_ACTIONS` | `False` | Whether to self-register `list_datasets`/`list_dataset_fields`/`list_field_values` as `"reference"`-type actions with Gundi. Leave off until the portal supports that action type (see above). |
 
 Set these in the environment or `.env` file the runner loads at startup (see `app/settings/`).
 

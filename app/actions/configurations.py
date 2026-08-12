@@ -29,6 +29,17 @@ class ListDatasetFieldsQuery(ReferenceActionConfiguration):
         return v
 
 
+class ListFieldValuesQuery(ReferenceActionConfiguration):
+    dataset: str
+    field: str
+
+    @pydantic.validator("dataset")
+    def dataset_in_registry(cls, v):
+        if v not in DATASET_REGISTRY:
+            raise ValueError(f"Unknown dataset '{v}'. Available: {sorted(DATASET_REGISTRY)}")
+        return v
+
+
 def _reference(action: str, params: Optional[dict] = None) -> dict:
     """Build a gundi:reference ui_schema annotation (contract vendored from
     gundi-integration-cmore). Deliberately does NOT set ui:widget — portals
@@ -149,6 +160,10 @@ class PullEventsConfig(PullActionConfiguration):
         filter_items.setdefault("field", {})["gundi:reference"] = _reference(
             "list_dataset_fields",
             {"dataset": {"$data": "../../dataset"}, "filterable_only": True},
+        )
+        filter_items.setdefault("value", {})["gundi:reference"] = _reference(
+            "list_field_values",
+            {"dataset": {"$data": "../../dataset"}, "field": {"$data": "field"}},
         )
         return ui
 

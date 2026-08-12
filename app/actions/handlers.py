@@ -8,8 +8,8 @@ import pydantic
 
 import app.settings
 from app.actions.configurations import (
-    AuthenticateConfig, ListDatasetsQuery, ListDatasetFieldsQuery, PullEventsConfig,
-    RunQueryJobConfig, entry_state_key, get_auth_config,
+    AuthenticateConfig, ListDatasetsQuery, ListDatasetFieldsQuery, ListFieldValuesQuery,
+    PullEventsConfig, RunQueryJobConfig, entry_state_key, get_auth_config,
 )
 from app.actions.core import ReferenceDataResponse, ReferenceOption
 from app.actions.datasets import DATASET_REGISTRY, QueryMode
@@ -63,6 +63,31 @@ async def action_list_dataset_fields(integration, action_config: ListDatasetFiel
         )
         for f in fields
     ]
+    return ReferenceDataResponse(options=options).dict()
+
+
+async def action_list_field_values(integration, action_config: ListFieldValuesQuery):
+    """Reference action: known values for a filter field (cascaded from the
+    row's dataset and field). Raster fields enumerate via /fields
+    values_table; vector fields fall back to the spec's curated map; anything
+    else returns no options (the portal keeps a free-text combobox)."""
+    fields = await DataAPI(username=None, password=None).get_dataset_fields(
+        dataset=action_config.dataset
+    )
+    match = next((f for f in fields if f.name == action_config.field), None)
+    rows = (match.values_table or {}).get("rows") if match else None
+    if rows:
+        options = [
+            ReferenceOption(
+                value=str(row["meaning"]), label=str(row["meaning"]),
+                description=f"raster value {row.get('value')}",
+            )
+            for row in rows if row.get("meaning")
+        ]
+    else:
+        curated = DATASET_REGISTRY[action_config.dataset].field_values.get(
+            action_config.field, {})
+        options = [ReferenceOption(value=v, label=label) for v, label in curated.items()]
     return ReferenceDataResponse(options=options).dict()
 
 

@@ -139,10 +139,11 @@ The discriminated union serializes to a JSON-schema `oneOf`, which react-jsonsch
 
 ## Reference actions & portal wiring
 
-Two reference actions (config subclasses `ReferenceActionConfiguration`; the config model's fields are the query params):
+Three reference actions (config subclasses `ReferenceActionConfiguration`; the config model's fields are the query params):
 
 - `action_list_datasets` — no params. Options from `DATASET_REGISTRY`: `value` = registry key, `label` = spec title, `description` from dataset metadata (live fetch, falling back to spec title alone on failure).
 - `action_list_dataset_fields(dataset: str, filterable_only: bool = False)` — live `GET /dataset/{dataset}/latest/fields`; `value` = field name, `label` = alias, `description` = description; `filterable_only=true` restricts to `is_filter` fields. Unknown dataset → 422-style validation error, not 500 (adopts the RFC recommendation; cmore's current handlers 500 here).
+- `action_list_field_values(dataset: str, field: str)` — known values for a filter field, in priority order: (1) the field's live `values_table` from `/fields` (raster datasets enumerate values natively — e.g. `gfw_integrated_alerts__confidence` → nominal/high/highest, `description` = `"raster value {value}"`); (2) a curated `DatasetSpec.field_values` map for datasets whose metadata doesn't enumerate values (vector datasets — e.g. VIIRS `confidence__cat` → h/n/l). Unknown or non-enumerable fields return no options (the portal keeps a free-text combobox), not an error. Unknown dataset → validation error, same as `list_dataset_fields`.
 
 Wiring in `PullEventsConfig.ui_schema()` via `gundi:reference` (never `ui:widget`):
 
@@ -151,6 +152,9 @@ Wiring in `PullEventsConfig.ui_schema()` via `gundi:reference` (never `ui:widget
 | `dataset_entries[].dataset` | `list_datasets` | — |
 | `dataset_entries[].fields[]` | `list_dataset_fields` | `{"dataset": {"$data": "../dataset"}}` |
 | `dataset_entries[].filters[].field` | `list_dataset_fields` | `{"dataset": {"$data": "../../dataset"}, "filterable_only": true}` |
+| `dataset_entries[].filters[].value` | `list_field_values` | `{"dataset": {"$data": "../../dataset"}, "field": {"$data": "field"}}` |
+
+The `value` annotation's `field` param climbs zero levels — it resolves against `field`'s bare sibling within the same `FilterRow`, unlike `dataset`'s two climbs up to the containing `DatasetEntry`.
 
 `$data` paths follow the portal's ratified resolver (gundi-portal `referencePath.ts`, *amended 2026-08-12*): the start level is the annotated field's containing node (for scalar-array items, the array itself), and each `../` climbs exactly one data-path segment — an array index is its own segment. This differs from the cmore Phase-0 comment convention, which the portal did not adopt. All annotations set `allow_free_text: true`.
 

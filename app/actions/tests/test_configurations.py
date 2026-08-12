@@ -66,7 +66,9 @@ def test_gundi_reference_annotations_match_registered_reference_actions():
     found = []
     _collect_gundi_references(PullEventsConfig.ui_schema(), found)
 
-    assert {ref["action"] for _, ref in found} == {"list_datasets", "list_dataset_fields"}
+    assert {ref["action"] for _, ref in found} == {
+        "list_datasets", "list_dataset_fields", "list_field_values",
+    }
     for host_node, ref in found:
         assert ref["target"] == "self"
         assert "ui:widget" not in host_node, ref["action"]
@@ -136,3 +138,13 @@ def test_gundi_reference_data_paths_resolve_against_portal_semantics():
     # and per-entry isolation: the second entry's filter resolves its own dataset
     assert _resolve_data_ref(filter_ref, ["dataset_entries", 1, "filters", 0, "field"], form_data) \
         == "gfw_integrated_alerts"
+
+    value_params = entry_items["filters"]["items"]["value"]["gundi:reference"]["params"]
+    dataset_ref = value_params["dataset"]["$data"]
+    field_ref = value_params["field"]["$data"]
+    # rjsf field path of dataset_entries[0].filters[0].value: dataset via 2 climbs
+    assert _resolve_data_ref(dataset_ref, ["dataset_entries", 0, "filters", 0, "value"], form_data) \
+        == "nasa_viirs_fire_alerts"
+    # field with zero climbs = sibling within the same FilterRow
+    assert _resolve_data_ref(field_ref, ["dataset_entries", 0, "filters", 0, "value"], form_data) \
+        == "confidence__cat"

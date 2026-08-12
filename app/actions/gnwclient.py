@@ -260,6 +260,7 @@ class DatasetField(pydantic.BaseModel):
     unit: Any = None
     is_feature_info: bool = True
     is_filter: bool = True
+    values_table: Optional[dict] = None
 
     @pydantic.root_validator(pre=True)
     def normalize_raster_shape(cls, values):

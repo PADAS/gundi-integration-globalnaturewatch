@@ -20,6 +20,9 @@ class DatasetSpec(pydantic.BaseModel):
     reingest_margin_days: int
     lat_field: str = "latitude"
     lon_field: str = "longitude"
+    # Known filter values for fields whose dataset metadata does not
+    # enumerate them (vector datasets have no values_table). value -> label.
+    field_values: Dict[str, Dict[str, str]] = pydantic.Field(default_factory=dict)
 
 
 DATASET_REGISTRY: Dict[str, DatasetSpec] = {
@@ -31,6 +34,9 @@ DATASET_REGISTRY: Dict[str, DatasetSpec] = {
         default_fields=["confidence__cat", "frp__MW"],
         default_lookback_days=10,
         reingest_margin_days=2,
+        field_values={
+            "confidence__cat": {"h": "high", "n": "nominal", "l": "low"},
+        },
     ),
     "gfw_integrated_alerts": DatasetSpec(
         title="GFW Integrated Deforestation Alerts",
