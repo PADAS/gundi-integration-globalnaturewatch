@@ -233,7 +233,10 @@ async def test_run_query_job_batch_failed_job_marks_failed_and_clears_pending(mo
 
 
 @pytest.mark.asyncio
-async def test_run_query_job_batch_expired_download_link_marks_failed(mocker, handler_env):
+async def test_run_query_job_batch_expired_download_link_stays_pending(mocker, handler_env):
+    """An expired download link is transient: the next poll returns a freshly
+    signed link, so the job must remain pending (bounded by the record TTL),
+    not be dropped as failed."""
     handlers, send, state_stub, integration = handler_env
     from app.actions.configurations import entry_state_key
     entry = DatasetEntry(dataset="gfw_integrated_alerts")
@@ -252,9 +255,12 @@ async def test_run_query_job_batch_expired_download_link_marks_failed(mocker, ha
                                window_end=datetime.date(2026, 8, 8), submit_new=False)
     result = await handlers.action_run_query_job(integration, config)
 
-    assert result["jobs_failed"] == 1
-    assert await handlers.gnw_state.get_pending_jobs(str(integration.id), key) == []
+    assert result["jobs_pending"] == 1
+    assert result["jobs_failed"] == 0
+    pending = await handlers.gnw_state.get_pending_jobs(str(integration.id), key)
+    assert [j["job_id"] for j in pending] == ["j1"]
     assert await handlers.gnw_state.get_window_anchor(str(integration.id), key) == "2026-07-09"
+    send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

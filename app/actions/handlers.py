@@ -164,13 +164,16 @@ async def action_run_query_job(integration: Integration, action_config: RunQuery
             try:
                 rows = await job.collect(download_link)
             except DownloadLinkExpiredException as e:
+                # Keep the job pending: the next poll's get_job_status returns a
+                # freshly signed download link, so removing the job here would
+                # delay (or, while the version gate stays closed, strand) its
+                # data. The pending-record TTL (24h) bounds the retries.
                 await log_action_activity(
                     integration_id=integration.id, action_id="run_query_job",
-                    level=LogLevel.ERROR,
-                    title=f"Batch job {job_id} download link expired",
+                    level=LogLevel.WARNING,
+                    title=f"Batch job {job_id} download link expired; will re-poll for a fresh link",
                     data={**job_data, "error": str(e)})
-                result["jobs_failed"] += 1
-                await gnw_state.remove_pending_job(integration_id, key, job_id)
+                result["jobs_pending"] += 1
                 continue
             try:
                 result["rows_fetched"] += len(rows)
