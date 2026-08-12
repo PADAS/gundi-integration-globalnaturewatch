@@ -99,3 +99,63 @@ async def test_get_aoi_and_geostore():
     client = DataAPI(username="u", password="p")
     aoi = await client.get_aoi(aoi_id="abc123")
     assert aoi.attributes.geostore == "geo-1"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_query_sync_returns_rows():
+    respx.post(f"{DataAPI.DATA_API_URL}/auth/token").respond(json=TOKEN_PAYLOAD)
+    respx.get(f"{DataAPI.DATA_API_URL}/auth/apikeys").respond(json={"data": [api_key_item()]})
+    respx.get(f"{DataAPI.DATA_API_URL}/dataset/nasa_viirs_fire_alerts/latest/query/json").respond(
+        json={"data": [{"latitude": 1.0, "longitude": 2.0, "alert__date": "2026-08-01"}]}
+    )
+    client = DataAPI(username="u", password="p")
+    rows = await client.query_sync(
+        dataset="nasa_viirs_fire_alerts",
+        sql="SELECT latitude,longitude,alert__date FROM results WHERE (alert__date >= '2026-08-01' AND alert__date <= '2026-08-08')",
+        geostore_id="geo-1",
+    )
+    assert rows == [{"latitude": 1.0, "longitude": 2.0, "alert__date": "2026-08-01"}]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_query_sync_raises_after_giveup(fast_backoff):
+    respx.post(f"{DataAPI.DATA_API_URL}/auth/token").respond(json=TOKEN_PAYLOAD)
+    respx.get(f"{DataAPI.DATA_API_URL}/auth/apikeys").respond(json={"data": [api_key_item()]})
+    respx.get(f"{DataAPI.DATA_API_URL}/dataset/nasa_viirs_fire_alerts/latest/query/json").respond(status_code=500)
+    client = DataAPI(username="u", password="p")
+    with pytest.raises(Exception):  # httpx.HTTPStatusError surfaces after retries
+        await client.query_sync(dataset="nasa_viirs_fire_alerts", sql="SELECT latitude FROM results", geostore_id="geo-1")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_query_batch_returns_job():
+    respx.post(f"{DataAPI.DATA_API_URL}/auth/token").respond(json=TOKEN_PAYLOAD)
+    respx.get(f"{DataAPI.DATA_API_URL}/auth/apikeys").respond(json={"data": [api_key_item()]})
+    respx.post(f"{DataAPI.DATA_API_URL}/dataset/gfw_integrated_alerts/latest/query/batch").respond(
+        json={"data": {"job_id": "job-1", "job_link": "https://data-api.globalforestwatch.org/job/job-1",
+                       "status": "pending"}, "status": "success"}
+    )
+    client = DataAPI(username="u", password="p")
+    job = await client.query_batch(dataset="gfw_integrated_alerts", sql="SELECT latitude FROM results", geostore_ids=["geo-1"])
+    assert job.job_id == "job-1"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_download_job_results_flattens_and_detects_expiry():
+    respx.post(f"{DataAPI.DATA_API_URL}/auth/token").respond(json=TOKEN_PAYLOAD)
+    respx.get(f"{DataAPI.DATA_API_URL}/auth/apikeys").respond(json={"data": [api_key_item()]})
+    respx.get("https://storage.example.com/results.json").respond(
+        json=[{"result": [{"latitude": 1.0}], "fid": "a"}, {"result": [{"latitude": 2.0}], "fid": "b"}]
+    )
+    client = DataAPI(username="u", password="p")
+    rows = await client.download_job_results("https://storage.example.com/results.json")
+    assert rows == [{"latitude": 1.0}, {"latitude": 2.0}]
+
+    from app.actions.gnwclient import DownloadLinkExpiredException
+    expired = "https://storage.example.com/results.json?Expires=1000000000"
+    with pytest.raises(DownloadLinkExpiredException):
+        await client.download_job_results(expired)

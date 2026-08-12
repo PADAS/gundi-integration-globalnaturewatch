@@ -537,3 +537,164 @@ class DataAPI:
             fields_response = DatasetFields.parse_obj(content)
 
             return fields_response.data
+
+    @backoff.on_exception(custom_backoff, (httpx.TimeoutException, httpx.HTTPStatusError),
+                          max_tries=3,
+                          on_backoff=backoff_hdlr)
+    async def query_sync(
+        self,
+        *,
+        dataset: str,
+        sql: str,
+        geostore_id: str
+    ):
+
+        api_key = await self.get_a_valid_api_key()
+        headers = {"x-api-key": api_key.api_key}
+
+        payload = {
+            'geostore_id': geostore_id,
+            'sql': sql
+        }
+
+        async def fn():
+            async with httpx.AsyncClient(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+
+                response = await client.get(f"{self.DATA_API_URL}/dataset/{dataset}/latest/query/json",
+                    headers=headers,
+                    params=payload,
+                    follow_redirects=True
+                )
+
+                if httpx.codes.is_success(response.status_code):
+                    data = response.json()
+                    data_len = len(data.get("data"))
+                    logger.info(f"Extracted {data_len} rows from dataset {dataset}, geostore_id: {geostore_id}.")
+                    return data.get("data", [])
+                else:
+                    logger.error(
+                        f"Failed getting data for dataset {dataset}. status: {response.status_code}, text: {response.text}",
+                        extra=payload,
+                    )
+                    response.raise_for_status()
+
+        return await fn()
+
+    @backoff.on_exception(custom_backoff, (httpx.TimeoutException, httpx.HTTPStatusError),
+                          max_tries=3,
+                          on_backoff=backoff_hdlr)
+    async def query_batch(
+        self,
+        *,
+        dataset: str,
+        sql: str,
+        geostore_ids: List[str]
+    ) -> JobResponse.Data:
+
+        api_key = await self.get_a_valid_api_key()
+        headers = {"x-api-key": api_key.api_key}
+
+        payload = {
+            'geostore_ids': geostore_ids,
+            'sql': sql,
+        }
+
+        async def fn():
+            async with httpx.AsyncClient(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+
+                response = await client.post(f"{self.DATA_API_URL}/dataset/{dataset}/latest/query/batch",
+                    headers=headers,
+                    json=payload,
+                    follow_redirects=True
+                )
+
+                if httpx.codes.is_success(response.status_code):
+                    data = response.json()
+                    return JobResponse.parse_obj(data).data
+                else:
+                    logger.error(
+                        f"Failed getting data for dataset {dataset}. status: {response.status_code}, text: {response.text}",
+                        extra=payload,
+                    )
+                    response.raise_for_status()
+
+        return await fn()
+
+    @backoff.on_exception(backoff.expo, (httpx.TimeoutException, httpx.HTTPStatusError), max_tries=3, factor=3)
+    async def get_job_status(self, job_link: str) -> JobResponse.Data:
+        """
+        Poll a batch job's status using its job_link.
+
+        Returns the job data with status, download_link, etc.
+        """
+        api_key = await self.get_a_valid_api_key()
+        headers = {"x-api-key": api_key.api_key}
+
+        async with httpx.AsyncClient(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+            response = await client.get(
+                job_link,
+                headers=headers,
+                follow_redirects=True
+            )
+            response.raise_for_status()
+
+            if httpx.codes.is_success(response.status_code):
+                data = response.json()
+                return JobResponse.parse_obj(data).data
+
+    @backoff.on_exception(backoff.expo, (httpx.TimeoutException,), max_tries=3, factor=3)
+    async def download_job_results(self, download_link: str) -> List[dict]:
+        """
+        Download JSON results from a completed batch job's download_link.
+
+        The response is an array of objects with 'result' lists and 'fid' strings:
+        [
+            {"result": [{alert}, {alert}, ...], "fid": "..."},
+            {"result": [{alert}, {alert}, ...], "fid": "..."},
+            ...
+        ]
+
+        Returns a flattened list of alert records from all result arrays.
+
+        Raises:
+            DownloadLinkExpiredException: If the download link has expired (either
+                detected via Expires parameter or 403 response).
+        """
+        # Check if the download link has expired before making the request
+        if is_download_link_expired(download_link):
+            expiry = get_download_link_expiry(download_link)
+            raise DownloadLinkExpiredException(
+                f"Download link expired at {expiry.isoformat() if expiry else 'unknown time'}"
+            )
+
+        api_key = await self.get_a_valid_api_key()
+        headers = {"x-api-key": api_key.api_key}
+
+        async with httpx.AsyncClient(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+            response = await client.get(
+                download_link,
+                headers=headers,
+                follow_redirects=True
+            )
+
+            # Handle 403 Forbidden as expired link
+            if response.status_code == 403:
+                raise DownloadLinkExpiredException(
+                    f"Download link returned 403 Forbidden (likely expired)"
+                )
+
+            response.raise_for_status()
+
+            if httpx.codes.is_success(response.status_code):
+                data = response.json()
+
+                # Response is an array of objects with 'result' lists
+                # Flatten all result arrays into a single list of alerts
+                if isinstance(data, list):
+                    alerts = []
+                    for item in data:
+                        if isinstance(item, dict) and 'result' in item:
+                            alerts.extend(item['result'])
+                    return alerts
+
+                return []
