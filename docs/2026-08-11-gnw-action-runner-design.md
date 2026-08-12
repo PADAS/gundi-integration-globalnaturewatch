@@ -22,7 +22,7 @@ A new Gundi v2 integration, **`gundi-integration-globalnaturewatch`**, that pull
 - No automatic dataset discovery beyond the allowlist (considered and rejected: the API's `/datasets` returns hundreds of context layers unsuited to Events).
 - No raw-SQL filter entry (considered and rejected: injection surface, poor UX).
 - No aggregation strategies beyond per-record and H3 grid in v1 (the seam is pluggable; only these two are implemented).
-- No event-level dedup via external IDs (matches current behavior; redundancy is prevented upstream — see Event semantics).
+- No event-level dedup via external IDs (matches current behavior; redundancy is bounded upstream instead — see Event semantics).
 
 ## Decisions (from brainstorming)
 
@@ -167,7 +167,7 @@ A drift-guard test (ported from cmore) asserts every `gundi:reference` annotatio
 3. Per entry, consult its **quiet period** — Redis TTL key, tiered as in the old integration: long randomized period after productive work (events were posted), short when idle, none while batch jobs are pending. Keyed by a **content hash of the entry** (dataset + fields + filters + output + event_type), so duplicate entries for the same dataset with different filters pace independently, and reordering entries does not disturb state.
 4. Per entry, check the **dataset version gate**: fetch `GET /dataset/{d}/latest` metadata; skip the entry if `updated_on` has not advanced past the stored `DatasetStatus.latest_updated_on` (keyed per dataset, shared across entries). `force_fetch` bypasses.
 5. Fan out work as `QueryJob` descriptors via `trigger_action` to the generic sub-action:
-   - **Sync entries:** one job per (geostore batch × date-window slice); windows generated as in the old `generate_date_pairs` (7-day slices). The queried range runs from the entry's stored window anchor (or `now - lookback_days` on the first run, or when the anchor is older than the lookback) to now; the anchor advances only on a fully successful run, so windows never overlap and failures are re-covered.
+   - **Sync entries:** one job per (geostore batch × date-window slice); windows generated as in the old `generate_date_pairs` (7-day slices), each queried as a half-open `[start, end)` SQL interval. `end` is always the next UTC midnight. `start` is the entry's stored window anchor, clamped in both directions every run: never older than `end - lookback_days` (so a stuck or ancient anchor can't force a permanent full-lookback re-pull once it falls behind the lookback window), and never newer than `end - reingest_margin_days` (`DatasetSpec.reingest_margin_days`: how far the dataset's own ingestion pipeline lags behind real time — e.g. VIIRS ingests through day D and into D+1; integrated alerts lag days-to-weeks — so a same-day anchor still re-covers data the provider hasn't finished backfilling). The effective `start` is persisted as the new anchor *before* fan-out; `action_run_query_job` only advances the anchor when the window it just completed started exactly at that stored anchor, so a failed or out-of-order slice is re-covered next run instead of silently advanced past. Consequence: records inside the reingest margin can be re-queried (and, absent event-level dedup, re-posted) on every run that opens a new dataset version — a bounded, deliberate at-least-once tradeoff in exchange for never permanently losing late-arriving data.
    - **Batch entries:** first collect completed pending jobs (poll → download → post → remove from pending set), then submit one new batch job covering the lookback window across all geostores.
 
 ### The job seam
@@ -195,7 +195,7 @@ Takes `RunQueryJobConfig` (`InternalActionConfiguration`): entry config + geosto
 ### SQL builder — `build_query(spec, entry, window, validated_fields) -> str`
 
 - SELECT list: `spec.lat_field`, `spec.lon_field`, `spec.date_field`, `spec.default_fields`, `entry.fields` — every identifier checked against the dataset's `/fields` inventory (identifier allowlisting, not escaping).
-- WHERE: `{date_field} >= '{window.start}' AND {date_field} <= '{window.end}'` with dates rendered from `date` objects, AND'd with each filter row rendered as `identifier operator typed-literal`. String literals are escaped and quoted; numeric/boolean literals rendered from parsed values; `in` renders a parenthesized literal list.
+- WHERE: `{date_field} >= '{window.start}' AND {date_field} < '{window.end}'` (half-open — the upper bound is exclusive, so consecutive windows that share an edge date never both match it) with dates rendered from `date` objects, AND'd with each filter row rendered as `identifier operator typed-literal`. String literals are escaped and quoted; numeric/boolean literals rendered from parsed values; `in` renders a parenthesized literal list.
 - No user-supplied string is ever interpolated into SQL unvalidated.
 
 ## Output strategies
@@ -224,11 +224,12 @@ Adding a strategy later = one class + one config model in the `output` union + o
 
 ## Event semantics & dedup
 
-No event-level external IDs (matches the old integration; Gundi/ER-side dedup is out of scope). Double-sends are prevented upstream:
+No event-level external IDs (matches the old integration; Gundi/ER-side dedup is out of scope). Double-sends are bounded, not eliminated:
 - The **dataset version gate** ensures a dataset is only re-fetched after the API reports new data.
 - **Quiet periods** pace runs per entry.
-- **Windows are anchored** to the last successful pull per entry, so successive sync runs query disjoint date ranges.
-- Batch jobs are removed from the pending set only after their results post successfully; a job that fails to post is retried on the next run, which is the one deliberate at-least-once seam (identical to the old integration).
+- **Windows are half-open** (`[start, end)`), so two windows that share a boundary date never both match it — the boundary-day double-count that an inclusive-both-ends interval would produce on multi-window catch-up runs is structurally impossible.
+- **Windows re-cover the reingest margin, not just the anchor.** Each run's `start` is clamped to `end - reingest_margin_days`, so every run re-queries the dataset's ingestion-lag window even when the stored anchor is more recent. This is deliberate at-least-once: records inside the margin can be re-fetched and re-posted once per dataset-version bump within that margin, trading a bounded amount of duplication for never permanently missing data the provider ingested late (the failure mode of a strictly-advancing anchor with no margin).
+- Batch jobs are removed from the pending set only after their results post successfully; a job that fails to post is retried on the next run, which is the same deliberate at-least-once seam (identical to the old integration).
 
 ## Error handling
 

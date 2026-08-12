@@ -17,6 +17,7 @@ class DatasetSpec(pydantic.BaseModel):
     default_event_type: str
     default_fields: List[str]
     default_lookback_days: int
+    reingest_margin_days: int
     lat_field: str = "latitude"
     lon_field: str = "longitude"
 
@@ -29,6 +30,7 @@ DATASET_REGISTRY: Dict[str, DatasetSpec] = {
         default_event_type="gnw_viirs_fires",
         default_fields=["confidence__cat", "frp__MW"],
         default_lookback_days=10,
+        reingest_margin_days=2,
     ),
     "gfw_integrated_alerts": DatasetSpec(
         title="GFW Integrated Deforestation Alerts",
@@ -37,5 +39,6 @@ DATASET_REGISTRY: Dict[str, DatasetSpec] = {
         default_event_type="gnw_integrated_alerts",
         default_fields=["gfw_integrated_alerts__confidence"],
         default_lookback_days=30,
+        reingest_margin_days=14,
     ),
 }

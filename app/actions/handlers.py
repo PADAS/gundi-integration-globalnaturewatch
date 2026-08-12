@@ -77,9 +77,12 @@ async def _post_rows(rows, entry, spec, integration_id) -> int:
 
 async def _advance_anchor_contiguously(integration_id, key, window_start: str, window_end: str):
     """Advance only when this window starts exactly at the stored anchor, so a
-    failed earlier slice is re-covered next run (at-least-once semantics)."""
+    failed earlier slice is re-covered next run (at-least-once semantics).
+    No None-wildcard: the orchestrator (action_pull_events) always persists the
+    effective start as the anchor before fan-out, so by the time any sub-action
+    runs the anchor is never None for a real run."""
     anchor = await gnw_state.get_window_anchor(integration_id, key)
-    if anchor is None or anchor == window_start:
+    if anchor == window_start:
         await gnw_state.set_window_anchor(integration_id, key, window_end)
 
 
@@ -302,14 +305,21 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
                 except pydantic.ValidationError:
                     logger.warning(f"Discarding invalid stored dataset status for {entry.dataset}")
 
-            # window: anchor-first
+            # window: anchor-first, pulled back by the dataset's reingest margin
             end = _next_midnight_utc().date()
             lookback_start = end - timedelta(days=entry.resolved_lookback_days(spec))
             anchor = await gnw_state.get_window_anchor(integration_id, key)
-            start = max(date.fromisoformat(anchor), lookback_start) if anchor else lookback_start
+            start_raw = date.fromisoformat(anchor) if anchor else lookback_start
+            # Pull back by the dataset's ingestion lag so late-arriving records are re-covered.
+            # Duplicates are bounded to the margin per version-gate opening (accepted at-least-once).
+            start = max(lookback_start, min(start_raw, end - timedelta(days=spec.reingest_margin_days)))
             if start >= end:
                 result["skipped"].append(f"{label} (window empty)")
                 continue
+            if anchor != start.isoformat():
+                # Persist the effective start BEFORE fan-out so the contiguous-advance rule
+                # in run_query_job holds exactly (fixes stuck-anchor and first-run races).
+                await gnw_state.set_window_anchor(integration_id, key, start.isoformat())
 
             if spec.query_mode == QueryMode.SYNC:
                 for window_start, window_end in generate_windows(start, end, interval_days=7):

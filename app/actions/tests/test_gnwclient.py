@@ -112,7 +112,7 @@ async def test_query_sync_returns_rows():
     client = DataAPI(username="u", password="p")
     rows = await client.query_sync(
         dataset="nasa_viirs_fire_alerts",
-        sql="SELECT latitude,longitude,alert__date FROM results WHERE (alert__date >= '2026-08-01' AND alert__date <= '2026-08-08')",
+        sql="SELECT latitude,longitude,alert__date FROM results WHERE (alert__date >= '2026-08-01' AND alert__date < '2026-08-08')",
         geostore_id="geo-1",
     )
     assert rows == [{"latitude": 1.0, "longitude": 2.0, "alert__date": "2026-08-01"}]
@@ -159,6 +159,17 @@ async def test_download_job_results_flattens_and_detects_expiry():
     expired = "https://storage.example.com/results.json?Expires=1000000000"
     with pytest.raises(DownloadLinkExpiredException):
         await client.download_job_results(expired)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_dataset_metadata_raises_on_500(fast_backoff):
+    respx.post(f"{DataAPI.DATA_API_URL}/auth/token").respond(json=TOKEN_PAYLOAD)
+    respx.get(f"{DataAPI.DATA_API_URL}/auth/apikeys").respond(json={"data": [api_key_item()]})
+    respx.get(f"{DataAPI.DATA_API_URL}/dataset/nasa_viirs_fire_alerts/latest").respond(status_code=500)
+    client = DataAPI(username="u", password="p")
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.get_dataset_metadata("nasa_viirs_fire_alerts")
 
 
 def test_dataset_field_normalizes_raster_shape():

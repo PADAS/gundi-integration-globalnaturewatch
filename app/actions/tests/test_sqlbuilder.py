@@ -27,7 +27,7 @@ def test_build_query_happy_path():
     # SELECT is deterministic: lat, lon, date_field, then defaults+extras in listed order
     assert sql == (
         "SELECT latitude,longitude,alert__date,confidence__cat,frp__MW FROM results"
-        " WHERE (alert__date >= '2026-08-01' AND alert__date <= '2026-08-08')"
+        " WHERE (alert__date >= '2026-08-01' AND alert__date < '2026-08-08')"
         " AND confidence__cat = 'h' AND frp__MW > 5.5"
     )
 

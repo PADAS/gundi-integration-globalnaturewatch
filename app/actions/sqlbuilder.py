@@ -91,7 +91,7 @@ def build_query(*, spec: DatasetSpec, extra_fields: List[str], filters: List[dic
             errors.append(f"Unknown field '{name}' for dataset '{spec.title}'")
 
     clauses = [f"({spec.date_field} >= '{window_start.isoformat()}'"
-               f" AND {spec.date_field} <= '{window_end.isoformat()}')"]
+               f" AND {spec.date_field} < '{window_end.isoformat()}')"]
     for flt in filters:
         field, operator, value = flt["field"], flt["operator"], flt["value"]
         if operator not in VALID_OPERATORS:

@@ -279,6 +279,58 @@ async def test_pull_events_uses_cached_aoi_and_triggers_sync_windows(mocker, orc
 
 
 @pytest.mark.asyncio
+async def test_pull_events_steady_state_recovers_late_ingested_data(mocker, orchestrator_env):
+    """Day-N run with a day-N anchor must still re-query the reingest margin."""
+    handlers, trigger, state_stub, integration = orchestrator_env
+    await handlers.gnw_state.set_aoi_data(str(integration.id), make_aoi_dict())
+    from app.actions.configurations import DatasetEntry, PullEventsConfig, entry_state_key
+    from datetime import date, timedelta
+    entry = DatasetEntry(dataset="nasa_viirs_fire_alerts")
+    key = entry_state_key(entry)
+    tomorrow = handlers._next_midnight_utc().date()
+    # anchor is already at "tomorrow" (yesterday's run anchored to its window end)
+    await handlers.gnw_state.set_window_anchor(str(integration.id), key, tomorrow.isoformat())
+    config = PullEventsConfig.parse_obj({
+        "aoi_url": "https://www.globalnaturewatch.org/dashboards/aoi/abc/",
+        "dataset_entries": [{"dataset": "nasa_viirs_fire_alerts"}]})
+    result = await handlers.action_pull_events(integration, config)
+    # margin=2 for viirs: the run must trigger a [tomorrow-2, tomorrow) window, not skip
+    assert trigger.await_count == 1
+    sub_config = trigger.call_args.kwargs["config"]
+    assert sub_config.window_start == tomorrow - timedelta(days=2)
+    assert sub_config.window_end == tomorrow
+    # and the anchor was pulled back to the effective start before fan-out
+    assert await handlers.gnw_state.get_window_anchor(str(integration.id), key) == (tomorrow - timedelta(days=2)).isoformat()
+
+
+@pytest.mark.asyncio
+async def test_pull_events_stuck_anchor_recovers_to_lookback_start(mocker, orchestrator_env):
+    """A stored anchor far behind the lookback window must not stay stuck: the
+    orchestrator clamps it up to lookback_start and persists that BEFORE fan-out,
+    so the contiguous-advance rule in run_query_job can fire on subsequent runs."""
+    handlers, trigger, state_stub, integration = orchestrator_env
+    await handlers.gnw_state.set_aoi_data(str(integration.id), make_aoi_dict())
+    from app.actions.configurations import DatasetEntry, PullEventsConfig, entry_state_key
+    from app.actions.datasets import DATASET_REGISTRY
+    entry = DatasetEntry(dataset="nasa_viirs_fire_alerts")
+    key = entry_state_key(entry)
+    await handlers.gnw_state.set_window_anchor(str(integration.id), key, "2020-01-01")
+    end = handlers._next_midnight_utc().date()
+    spec = DATASET_REGISTRY["nasa_viirs_fire_alerts"]
+    lookback_start = end - datetime.timedelta(days=entry.resolved_lookback_days(spec))
+    config = PullEventsConfig.parse_obj({
+        "aoi_url": "https://www.globalnaturewatch.org/dashboards/aoi/abc/",
+        "dataset_entries": [{"dataset": "nasa_viirs_fire_alerts"}]})
+    result = await handlers.action_pull_events(integration, config)
+    assert await handlers.gnw_state.get_window_anchor(str(integration.id), key) == lookback_start.isoformat()
+    # all triggered windows fall within [lookback_start, end)
+    for call in trigger.call_args_list:
+        sub_config = call.kwargs["config"]
+        assert sub_config.window_start >= lookback_start
+        assert sub_config.window_end <= end
+
+
+@pytest.mark.asyncio
 async def test_pull_events_skips_on_quiet_period(mocker, orchestrator_env):
     handlers, trigger, state_stub, integration = orchestrator_env
     await handlers.gnw_state.set_aoi_data(str(integration.id), make_aoi_dict())

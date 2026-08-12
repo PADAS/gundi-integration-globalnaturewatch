@@ -496,6 +496,8 @@ class DataAPI:
                 follow_redirects=True
             )
 
+            response.raise_for_status()
+
             if httpx.codes.is_success(response.status_code):
                 data = response.json()
                 return DatasetResponseItem.parse_obj(data.get("data"))

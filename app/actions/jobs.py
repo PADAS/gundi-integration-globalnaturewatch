@@ -19,8 +19,8 @@ class JobState(str, Enum):
 
 def generate_windows(start: date, end: date, interval_days: int = 7) -> List[Tuple[date, date]]:
     """Contiguous [start, end] slices, oldest first. Boundaries overlap by a
-    day-edge only (upper bound of one == lower bound of the next), matching
-    the API's inclusive date filtering; the version gate prevents re-pulls."""
+    day-edge only (upper bound of one == lower bound of the next); the SQL
+    interval is half-open, so shared edges do not double-count."""
     windows = []
     lower = start
     while lower < end:

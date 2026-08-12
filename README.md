@@ -28,6 +28,7 @@ DATASET_REGISTRY: Dict[str, DatasetSpec] = {
         default_event_type="gnw_viirs_fires",
         default_fields=["confidence__cat", "frp__MW"],
         default_lookback_days=10,
+        reingest_margin_days=2,              # how far this dataset's ingestion lags real time
     ),
     ...
 }
@@ -35,9 +36,11 @@ DATASET_REGISTRY: Dict[str, DatasetSpec] = {
 
 Everything else about a dataset — field inventory, types, filterability, descriptions — comes live from the API (`GET /dataset/{dataset}/latest/fields`, `GET /dataset/{dataset}/{version}`).
 
+`reingest_margin_days` bounds how far behind "now" each run re-queries, regardless of where the stored window anchor sits (see "Windows & the reingest margin" below) — set it to how long the dataset's own ingestion pipeline lags behind real-world events (VIIRS: ~2 days; GFW integrated alerts: ~14 days, since they aggregate multiple slower-arriving alert systems).
+
 ### Adding a dataset to the offering
 
-1. Add one entry to `DATASET_REGISTRY` with the dataset's slug, its date field, query mode (`sync` for the inline `query/json` endpoint, `batch` for `query/batch` + job polling), a default event type, default fields, and a default lookback window.
+1. Add one entry to `DATASET_REGISTRY` with the dataset's slug, its date field, query mode (`sync` for the inline `query/json` endpoint, `batch` for `query/batch` + job polling), a default event type, default fields, a default lookback window, and a reingest margin (how many days behind real time the dataset's own ingestion lags).
 2. Add a committed `/fields` fixture so the field-inventory validation logic has real data to test against (field names and availability drift across dataset versions). Fetch the live inventory and drop it into [`app/actions/tests/fields_fixtures.py`](app/actions/tests/fields_fixtures.py):
    ```bash
    curl -s https://data-api.globalforestwatch.org/dataset/<dataset-slug>/latest/fields | python -m json.tool
@@ -75,6 +78,15 @@ Each `DatasetEntry`:
 Runtime validation happens at the start of every pull run, per entry: the dataset key must be in the registry, every selected/filtered field must exist in that dataset's live `/fields`, filter fields must be filterable, and filter values must parse to the field's declared type. Invalid entries are logged to the activity log and skipped; the rest of the entries still run (per-entry isolation).
 
 **Internal sub-action**: `action_run_query_job` (`RunQueryJobConfig`, an `InternalActionConfiguration`) is not portal-visible. It's triggered by `action_pull_events` once per (entry, window) slice, and does the actual query → output-strategy → `send_events_to_gundi` work under a shared concurrency semaphore.
+
+### Windows & the reingest margin
+
+Each entry's queried window is `[start, end)` — half-open, so a shared boundary date between two consecutive windows is never queried twice. `end` is always the next UTC midnight; `start` is the entry's stored **window anchor**, clamped in two directions every run:
+
+- Up to `lookback_start` (`end - lookback_days`), so a stuck or ancient anchor can never force a full-lookback re-pull forever.
+- Down to `end - reingest_margin_days`, so even a same-day anchor still re-covers the dataset's ingestion lag — the provider may still be backfilling `end`'s data days after `end` passes.
+
+The effective `start` is persisted as the new anchor *before* any sub-action runs, and `action_run_query_job` only advances the anchor when the window it just finished started exactly at that stored anchor — so a failed or out-of-order slice is safely re-covered next run instead of silently skipped. The tradeoff: records within the reingest margin can be re-queried and re-posted on every run that opens a new dataset version (no event-level dedup — see the design doc's "Event semantics & dedup" section) — bounded, deliberate at-least-once duplication rather than the alternative of permanently missing late-arriving data.
 
 **Reference actions** (`action_list_datasets`, `action_list_dataset_fields`) are also not portal-configurable in the usual sense — see below.
 
