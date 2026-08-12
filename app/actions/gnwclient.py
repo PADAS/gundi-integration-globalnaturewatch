@@ -255,12 +255,20 @@ class DatasetResponse(pydantic.BaseModel):
 
 class DatasetField(pydantic.BaseModel):
     name: str
-    alias: str
-    description: Any
-    data_type: str
-    unit: Any
-    is_feature_info: bool
-    is_filter: bool
+    alias: Optional[str] = None
+    description: Any = None
+    data_type: Optional[str] = None
+    unit: Any = None
+    is_feature_info: bool = True
+    is_filter: bool = True
+
+    @pydantic.root_validator(pre=True)
+    def normalize_raster_shape(cls, values):
+        # Raster datasets (e.g. gfw_integrated_alerts) name their bands
+        # 'pixel_meaning' and omit the vector-only metadata keys.
+        if not values.get("name") and values.get("pixel_meaning"):
+            values["name"] = values["pixel_meaning"]
+        return values
 
 
 class DatasetFields(pydantic.BaseModel):

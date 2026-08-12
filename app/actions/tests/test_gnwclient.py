@@ -159,3 +159,17 @@ async def test_download_job_results_flattens_and_detects_expiry():
     expired = "https://storage.example.com/results.json?Expires=1000000000"
     with pytest.raises(DownloadLinkExpiredException):
         await client.download_job_results(expired)
+
+
+def test_dataset_field_normalizes_raster_shape():
+    from app.actions.gnwclient import DatasetField
+    raster = DatasetField.parse_obj({"pixel_meaning": "area__ha", "unit": None, "description": None,
+                                     "statistics": None, "values_table": None, "data_type": None,
+                                     "compression": None, "no_data_value": None})
+    assert raster.name == "area__ha"
+    assert raster.alias is None and raster.data_type is None
+    assert raster.is_filter is True
+    vector = DatasetField.parse_obj({"name": "frp__MW", "alias": "FRP", "description": None,
+                                     "data_type": "numeric", "unit": "MW",
+                                     "is_feature_info": True, "is_filter": True})
+    assert vector.name == "frp__MW" and vector.data_type == "numeric"

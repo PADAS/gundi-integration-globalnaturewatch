@@ -15,8 +15,9 @@ def test_registry_ships_parity_datasets():
 def test_spec_defaults_exist_in_fields_fixtures():
     """Every default_field, date_field, lat/lon field must exist in the real
     /fields inventory committed as a fixture — catches spec/API drift."""
+    from app.actions.gnwclient import DatasetField
     fixtures = {"nasa_viirs_fire_alerts": VIIRS_FIELDS, "gfw_integrated_alerts": INTEGRATED_FIELDS}
     for key, spec in DATASET_REGISTRY.items():
-        names = {f["name"] for f in fixtures[key]}
+        names = {DatasetField.parse_obj(f).name for f in fixtures[key]}
         for field in [spec.date_field, spec.lat_field, spec.lon_field, *spec.default_fields]:
             assert field in names, f"{key}: '{field}' not in /fields fixture"
