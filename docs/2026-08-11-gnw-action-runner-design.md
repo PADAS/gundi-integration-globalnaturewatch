@@ -149,10 +149,10 @@ Wiring in `PullEventsConfig.ui_schema()` via `gundi:reference` (never `ui:widget
 | Field | Action | Params |
 |---|---|---|
 | `dataset_entries[].dataset` | `list_datasets` | — |
-| `dataset_entries[].fields[]` | `list_dataset_fields` | `{"dataset": {"$data": "../../dataset"}}` |
-| `dataset_entries[].filters[].field` | `list_dataset_fields` | `{"dataset": {"$data": "../../../../dataset"}, "filterable_only": true}` |
+| `dataset_entries[].fields[]` | `list_dataset_fields` | `{"dataset": {"$data": "../dataset"}}` |
+| `dataset_entries[].filters[].field` | `list_dataset_fields` | `{"dataset": {"$data": "../../dataset"}, "filterable_only": true}` |
 
-`$data` paths follow the cmore convention: paths are relative to the object containing the annotated field, and an array and its items count as separate levels. All annotations set `allow_free_text: true`.
+`$data` paths follow the portal's ratified resolver (gundi-portal `referencePath.ts`, *amended 2026-08-12*): the start level is the annotated field's containing node (for scalar-array items, the array itself), and each `../` climbs exactly one data-path segment — an array index is its own segment. This differs from the cmore Phase-0 comment convention, which the portal did not adopt. All annotations set `allow_free_text: true`.
 
 **Portal dependency:** portal support for reference actions (Phase 1 of the cmore RFC) is not built. Until it lands, annotated fields render as plain text inputs — users type dataset keys and field names, validated at runtime with clear activity-log errors. Registration of reference actions stays behind `REGISTER_REFERENCE_ACTIONS` (default off) until the platform accepts the `"reference"` action type. No enum snapshots are baked into the schema as a bridge (considered and rejected: re-introduces static-schema machinery this design exists to avoid).
 

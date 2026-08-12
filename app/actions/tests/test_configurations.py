@@ -79,3 +79,60 @@ def test_gundi_reference_annotations_match_registered_reference_actions():
         assert (declared | data_bound) <= model_fields
         required = {n for n, f in config_model.__fields__.items() if f.required}
         assert required <= (declared | data_bound)
+
+
+def _resolve_data_ref(rel_path, field_path, root_form_data):
+    """Python mirror of the portal's resolveDataRef (gundi-portal
+    src/components/common/SchemaFormTemplates/referencePath.ts): start level =
+    the annotated field's containing node (drop the last path segment); each
+    "../" climbs exactly one data-path segment; remainder is a dotted
+    descendant path."""
+    climbs = 0
+    while rel_path.startswith("../"):
+        climbs += 1
+        rel_path = rel_path[3:]
+    level_length = len(field_path) - 1 - climbs
+    if level_length < 0:
+        return None
+    full_path = list(field_path[:level_length]) + (rel_path.split(".") if rel_path else [])
+    current = root_form_data
+    for seg in full_path:
+        if current is None:
+            return None
+        try:
+            current = current[seg]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return current
+
+
+def test_gundi_reference_data_paths_resolve_against_portal_semantics():
+    """Pin the $data climb counts to the portal's ratified resolver. The
+    filter-field and fields-item annotations must resolve to the entry's
+    chosen dataset from their respective rjsf field paths."""
+    from app.actions.configurations import PullEventsConfig
+
+    form_data = {
+        "aoi_url": "https://www.globalnaturewatch.org/dashboards/aoi/abc/",
+        "dataset_entries": [
+            {"dataset": "nasa_viirs_fire_alerts", "fields": ["frp__MW"],
+             "filters": [{"field": "confidence__cat", "operator": "=", "value": "h"}]},
+            {"dataset": "gfw_integrated_alerts", "fields": [],
+             "filters": [{"field": "", "operator": "=", "value": ""}]},
+        ],
+    }
+    ui = PullEventsConfig.ui_schema()
+    entry_items = ui["dataset_entries"]["items"]
+
+    fields_ref = entry_items["fields"]["items"]["gundi:reference"]["params"]["dataset"]["$data"]
+    # rjsf field path of dataset_entries[1].fields[0] (a scalar-array item)
+    assert _resolve_data_ref(fields_ref, ["dataset_entries", 1, "fields", 0], form_data) \
+        == "gfw_integrated_alerts"
+
+    filter_ref = entry_items["filters"]["items"]["field"]["gundi:reference"]["params"]["dataset"]["$data"]
+    # rjsf field path of dataset_entries[0].filters[0].field
+    assert _resolve_data_ref(filter_ref, ["dataset_entries", 0, "filters", 0, "field"], form_data) \
+        == "nasa_viirs_fire_alerts"
+    # and per-entry isolation: the second entry's filter resolves its own dataset
+    assert _resolve_data_ref(filter_ref, ["dataset_entries", 1, "filters", 0, "field"], form_data) \
+        == "gfw_integrated_alerts"
