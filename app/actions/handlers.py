@@ -114,49 +114,70 @@ async def action_run_query_job(integration: Integration, action_config: RunQuery
         await gnw_state.set_quiet_period(integration_id, key, timedelta(minutes=quiet))
         return result
 
-    # BATCH mode: poll pending jobs first.
+    # BATCH mode: poll pending jobs first. Each phase (check / collect / post /
+    # cleanup) is handled separately so a failure after events have already
+    # been posted is never silently swallowed as "still pending" — that would
+    # cause the job to be re-collected and re-posted next run (double-post).
     for job_data in await gnw_state.get_pending_jobs(integration_id, key):
+        job_id = job_data.get("job_id")
         job = BatchQueryJob(client, dataset=entry.dataset, sql=sql,
                             geostore_ids=action_config.geostore_ids)
         try:
             state, download_link, message = await job.check(job_data["job_link"])
-            if state == JobState.RESULTS_READY:
-                if message == "partial_success":
-                    await log_action_activity(
-                        integration_id=integration.id, action_id="run_query_job",
-                        level=LogLevel.WARNING,
-                        title=f"Batch job {job_data['job_id']} completed with partial success",
-                        data=job_data)
-                try:
-                    rows = await job.collect(download_link)
-                except DownloadLinkExpiredException as e:
-                    await log_action_activity(
-                        integration_id=integration.id, action_id="run_query_job",
-                        level=LogLevel.ERROR,
-                        title=f"Batch job {job_data['job_id']} download link expired",
-                        data={**job_data, "error": str(e)})
-                    result["jobs_failed"] += 1
-                    await gnw_state.remove_pending_job(integration_id, key, job_data["job_id"])
-                    continue
-                result["rows_fetched"] += len(rows)
-                result["events_posted"] += await _post_rows(rows, entry, spec, integration_id)
-                result["jobs_completed"] += 1
-                await gnw_state.remove_pending_job(integration_id, key, job_data["job_id"])
-                if job_data.get("window_start") and job_data.get("window_end"):
-                    await _advance_anchor_contiguously(
-                        integration_id, key, job_data["window_start"], job_data["window_end"])
-            elif state == JobState.FAILED:
+        except Exception:
+            logger.exception(f"Error polling job {job_id}")
+            result["jobs_pending"] += 1
+            continue
+
+        if state == JobState.RESULTS_READY:
+            if message == "partial_success":
+                await log_action_activity(
+                    integration_id=integration.id, action_id="run_query_job",
+                    level=LogLevel.WARNING,
+                    title=f"Batch job {job_id} completed with partial success",
+                    data=job_data)
+            try:
+                rows = await job.collect(download_link)
+            except DownloadLinkExpiredException as e:
                 await log_action_activity(
                     integration_id=integration.id, action_id="run_query_job",
                     level=LogLevel.ERROR,
-                    title=f"Batch job {job_data['job_id']} failed",
-                    data={**job_data, "message": message})
+                    title=f"Batch job {job_id} download link expired",
+                    data={**job_data, "error": str(e)})
                 result["jobs_failed"] += 1
-                await gnw_state.remove_pending_job(integration_id, key, job_data["job_id"])
-            else:
+                await gnw_state.remove_pending_job(integration_id, key, job_id)
+                continue
+            try:
+                result["rows_fetched"] += len(rows)
+                result["events_posted"] += await _post_rows(rows, entry, spec, integration_id)
+            except Exception:
+                # Post failed: keep the job pending so the next run retries (at-least-once).
+                logger.exception(f"Failed posting results of job {job_id}; leaving pending for retry")
                 result["jobs_pending"] += 1
-        except Exception:
-            logger.exception(f"Error polling job {job_data.get('job_id')}")
+                continue
+            result["jobs_completed"] += 1
+            try:
+                await gnw_state.remove_pending_job(integration_id, key, job_id)
+                if job_data.get("window_start") and job_data.get("window_end"):
+                    await _advance_anchor_contiguously(
+                        integration_id, key, job_data["window_start"], job_data["window_end"])
+            except Exception:
+                # Events already posted; job may be re-collected next run. Loud, not silent.
+                logger.exception(f"State cleanup failed after posting job {job_id}")
+                await log_action_activity(
+                    integration_id=integration.id, action_id="run_query_job",
+                    level=LogLevel.ERROR,
+                    title=f"Batch job {job_id}: cleanup failed after posting; duplicate events possible on next poll",
+                    data=job_data)
+        elif state == JobState.FAILED:
+            await log_action_activity(
+                integration_id=integration.id, action_id="run_query_job",
+                level=LogLevel.ERROR,
+                title=f"Batch job {job_id} failed",
+                data={**job_data, "message": message})
+            result["jobs_failed"] += 1
+            await gnw_state.remove_pending_job(integration_id, key, job_id)
+        else:
             result["jobs_pending"] += 1
 
     if action_config.submit_new:

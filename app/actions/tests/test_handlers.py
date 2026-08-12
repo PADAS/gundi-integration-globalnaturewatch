@@ -3,7 +3,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.actions.configurations import DatasetEntry, RunQueryJobConfig
-from app.actions.gnwclient import DataAPI, JobResponse
+from app.actions.gnwclient import DataAPI, DownloadLinkExpiredException, JobResponse
 from app.actions.tests.fixtures import stub_state_manager  # reuse the stub fixture
 
 FIELDS_JSON = {"data": [
@@ -110,6 +110,8 @@ async def test_run_query_job_batch_submits_and_persists(mocker, handler_env):
     jobs = await handlers.gnw_state.get_pending_jobs(str(integration.id), key)
     assert jobs[0]["job_id"] == "j1"
     assert jobs[0]["window_end"] == "2026-08-08"
+    # A submitted job sets the long (240-720 min) quiet tier.
+    assert await handlers.gnw_state.is_quiet_period(str(integration.id), key)
 
 
 @pytest.mark.asyncio
@@ -136,3 +138,105 @@ async def test_run_query_job_batch_collects_completed_job(mocker, handler_env):
     assert result["jobs_completed"] == 1 and result["events_posted"] == 1
     assert await handlers.gnw_state.get_pending_jobs(str(integration.id), key) == []
     assert await handlers.gnw_state.get_window_anchor(str(integration.id), key) == "2026-08-08"
+
+
+@pytest.mark.asyncio
+async def test_run_query_job_batch_failed_job_marks_failed_and_clears_pending(mocker, handler_env):
+    handlers, send, state_stub, integration = handler_env
+    from app.actions.configurations import entry_state_key
+    entry = DatasetEntry(dataset="gfw_integrated_alerts")
+    key = entry_state_key(entry)
+    await handlers.gnw_state.set_window_anchor(str(integration.id), key, "2026-07-09")
+    await handlers.gnw_state.add_pending_job(str(integration.id), key, {
+        "job_id": "j1", "job_link": "https://api.example.com/job/j1",
+        "window_start": "2026-07-09", "window_end": "2026-08-08"})
+    mocker.patch.object(DataAPI, "get_job_status", AsyncMock(return_value=JobResponse.Data(
+        job_id="j1", status="failed", message="boom")))
+
+    config = RunQueryJobConfig(entry=entry, geostore_ids=["geo-1"],
+                               window_start=datetime.date(2026, 7, 9),
+                               window_end=datetime.date(2026, 8, 8), submit_new=False)
+    result = await handlers.action_run_query_job(integration, config)
+
+    assert result["jobs_failed"] == 1
+    assert await handlers.gnw_state.get_pending_jobs(str(integration.id), key) == []
+    # A failed job must not advance the anchor: the window is re-covered next run.
+    assert await handlers.gnw_state.get_window_anchor(str(integration.id), key) == "2026-07-09"
+
+
+@pytest.mark.asyncio
+async def test_run_query_job_batch_expired_download_link_marks_failed(mocker, handler_env):
+    handlers, send, state_stub, integration = handler_env
+    from app.actions.configurations import entry_state_key
+    entry = DatasetEntry(dataset="gfw_integrated_alerts")
+    key = entry_state_key(entry)
+    await handlers.gnw_state.set_window_anchor(str(integration.id), key, "2026-07-09")
+    await handlers.gnw_state.add_pending_job(str(integration.id), key, {
+        "job_id": "j1", "job_link": "https://api.example.com/job/j1",
+        "window_start": "2026-07-09", "window_end": "2026-08-08"})
+    mocker.patch.object(DataAPI, "get_job_status", AsyncMock(return_value=JobResponse.Data(
+        job_id="j1", status="success", download_link="https://dl.example.com/x")))
+    mocker.patch.object(DataAPI, "download_job_results", AsyncMock(
+        side_effect=DownloadLinkExpiredException("link expired")))
+
+    config = RunQueryJobConfig(entry=entry, geostore_ids=["geo-1"],
+                               window_start=datetime.date(2026, 7, 9),
+                               window_end=datetime.date(2026, 8, 8), submit_new=False)
+    result = await handlers.action_run_query_job(integration, config)
+
+    assert result["jobs_failed"] == 1
+    assert await handlers.gnw_state.get_pending_jobs(str(integration.id), key) == []
+    assert await handlers.gnw_state.get_window_anchor(str(integration.id), key) == "2026-07-09"
+
+
+@pytest.mark.asyncio
+async def test_run_query_job_batch_post_failure_keeps_job_pending_for_retry(mocker, handler_env):
+    handlers, send, state_stub, integration = handler_env
+    from app.actions.configurations import entry_state_key
+    entry = DatasetEntry(dataset="gfw_integrated_alerts")
+    key = entry_state_key(entry)
+    await handlers.gnw_state.set_window_anchor(str(integration.id), key, "2026-07-09")
+    await handlers.gnw_state.add_pending_job(str(integration.id), key, {
+        "job_id": "j1", "job_link": "https://api.example.com/job/j1",
+        "window_start": "2026-07-09", "window_end": "2026-08-08"})
+    mocker.patch.object(DataAPI, "get_job_status", AsyncMock(return_value=JobResponse.Data(
+        job_id="j1", status="success", download_link="https://dl.example.com/x")))
+    mocker.patch.object(DataAPI, "download_job_results", AsyncMock(return_value=[
+        {"latitude": 1.0, "longitude": 2.0, "gfw_integrated_alerts__date": "2026-08-01",
+         "gfw_integrated_alerts__confidence": "high"}]))
+    # Simulate the post to Gundi failing after a successful download.
+    send.side_effect = Exception("gundi is down")
+
+    config = RunQueryJobConfig(entry=entry, geostore_ids=["geo-1"],
+                               window_start=datetime.date(2026, 7, 9),
+                               window_end=datetime.date(2026, 8, 8), submit_new=False)
+    result = await handlers.action_run_query_job(integration, config)
+
+    assert result["jobs_pending"] == 1
+    assert result["jobs_completed"] == 0
+    # Job must NOT be removed: the next run must retry the collect+post (at-least-once).
+    jobs = await handlers.gnw_state.get_pending_jobs(str(integration.id), key)
+    assert len(jobs) == 1 and jobs[0]["job_id"] == "j1"
+    assert await handlers.gnw_state.get_window_anchor(str(integration.id), key) == "2026-07-09"
+
+
+@pytest.mark.asyncio
+async def test_run_query_job_batch_still_pending_sets_zero_minute_quiet_tier(mocker, handler_env):
+    handlers, send, state_stub, integration = handler_env
+    from app.actions.configurations import entry_state_key
+    entry = DatasetEntry(dataset="gfw_integrated_alerts")
+    key = entry_state_key(entry)
+    await handlers.gnw_state.add_pending_job(str(integration.id), key, {
+        "job_id": "j1", "job_link": "https://api.example.com/job/j1",
+        "window_start": "2026-07-09", "window_end": "2026-08-08"})
+    mocker.patch.object(DataAPI, "get_job_status", AsyncMock(return_value=JobResponse.Data(
+        job_id="j1", status="pending")))
+
+    config = RunQueryJobConfig(entry=entry, geostore_ids=["geo-1"],
+                               window_start=datetime.date(2026, 7, 9),
+                               window_end=datetime.date(2026, 8, 8), submit_new=False)
+    result = await handlers.action_run_query_job(integration, config)
+
+    assert result["jobs_pending"] == 1
+    # jobs_pending > 0 -> 0-minute quiet tier, i.e. set_quiet_period is a no-op.
+    assert not await handlers.gnw_state.is_quiet_period(str(integration.id), key)
