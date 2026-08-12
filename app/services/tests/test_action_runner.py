@@ -798,3 +798,36 @@ async def test_reference_action_error_omits_integration_config(
     failed_events = _published_events_of_type(mock_publish_event, IntegrationActionFailed)
     assert len(failed_events) == 1
     assert not failed_events[0].payload.config_data.get("configurations")
+
+
+@pytest.mark.asyncio
+async def test_non_reference_action_error_still_attaches_integration_config(
+        mocker, mock_gundi_client_v2, mock_publish_event, integration_v2, mock_config_manager,
+        mock_action_handlers,
+):
+    """Inverse of test_reference_action_error_omits_integration_config: a
+    NON-reference action's handler failure must still carry the integration's
+    stored configurations in config_data — both to _handle_error and in the
+    published IntegrationActionFailed event. Pins that handler_error_config_data
+    isn't collapsed to None unconditionally."""
+    mock_handler, _, _ = mock_action_handlers["pull_observations"]
+    mock_handler.side_effect = RuntimeError("upstream 502")
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    spy = mocker.spy(action_runner, "_handle_error")
+
+    response = await execute_action(integration_id=str(integration_v2.id), action_id="pull_observations")
+
+    config_data = spy.call_args.kwargs.get("config_data")
+    assert config_data is not None
+    assert config_data.get("configurations")
+
+    response_body = json.loads(response.body)
+    assert response_body["detail"]["config_data"].get("configurations")
+
+    failed_events = _published_events_of_type(mock_publish_event, IntegrationActionFailed)
+    assert len(failed_events) == 1
+    assert failed_events[0].payload.config_data.get("configurations")
