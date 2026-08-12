@@ -43,6 +43,9 @@ from app.webhooks import (
     WebhookConfiguration,
 )
 
+# Integration-specific fixtures load
+from app.actions.tests.fixtures import *
+
 
 class AsyncMock(MagicMock):
     async def __call__(self, *args, **kwargs):

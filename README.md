@@ -1,12 +1,138 @@
-# gundi-integration-action-runner
-Template repo for integration in Gundi v2.
+# gundi-integration-globalnaturewatch
+Gundi v2 integration for Global Nature Watch — pulls curated GFW Data API datasets into Gundi Events. (Replaces `gundi-integration-gfw`.)
 
-## Usage
-- Fork this repo
-- Implement your own actions in `actions/handlers.py`
-- Define configurations needed for your actions in `action/configurations.py`
-- Or implement a webhooks handler in `webhooks/handlers.py`
-- and define configurations needed for your webhooks in `webhooks/configurations.py`
+## What this is
+
+This integration polls the [GFW Data API](https://data-api.globalforestwatch.org) (`data-api.globalforestwatch.org`) for one or more curated datasets scoped to a user's AOI, and forwards the results to Gundi as Events. It supersedes `gundi-integration-gfw`, which hardcoded exactly two datasets (NASA VIIRS fire alerts and GFW integrated deforestation alerts) with no per-user field or filter control.
+
+Compared to the old integration:
+- Users choose which datasets to pull from a **curated allowlist** (see below), entirely through Gundi portal configuration — no code change per user.
+- Each dataset entry lets the user pick extra fields, apply filters, and choose whether Events are created **per record** or **aggregated into H3 grid cells**.
+- A single generic fetch pipeline (`action_run_query_job`) replaces the old repo's four dataset-specific handlers.
+- Handler-level test coverage from day one.
+
+The full design rationale and decisions live in [`docs/2026-08-11-gnw-action-runner-design.md`](docs/2026-08-11-gnw-action-runner-design.md).
+
+Existing GFW-integration users migrate by creating a new Global Nature Watch integration; the per-entry `event_type` field lets them keep existing ER event types (e.g. `gfwfirealert`, `gfwgladalert`) during migration.
+
+## Dataset allowlist
+
+Datasets offered to users are a checked-in registry, `DATASET_REGISTRY` in [`app/actions/datasets.py`](app/actions/datasets.py). Each entry carries only what the Data API can't report about itself:
+
+```python
+DATASET_REGISTRY: Dict[str, DatasetSpec] = {
+    "nasa_viirs_fire_alerts": DatasetSpec(
+        title="NASA VIIRS Fire Alerts",
+        date_field="alert__date",
+        query_mode=QueryMode.SYNC,           # or QueryMode.BATCH
+        default_event_type="gnw_viirs_fires",
+        default_fields=["confidence__cat", "frp__MW"],
+        default_lookback_days=10,
+        reingest_margin_days=2,              # how far this dataset's ingestion lags real time
+    ),
+    ...
+}
+```
+
+Everything else about a dataset — field inventory, types, filterability, descriptions — comes live from the API (`GET /dataset/{dataset}/latest/fields`, `GET /dataset/{dataset}/{version}`).
+
+`reingest_margin_days` bounds how far behind "now" each run re-queries, regardless of where the stored window anchor sits (see "Windows & the reingest margin" below) — set it to how long the dataset's own ingestion pipeline lags behind real-world events (VIIRS: ~2 days; GFW integrated alerts: ~14 days, since they aggregate multiple slower-arriving alert systems).
+
+### Adding a dataset to the offering
+
+1. Add one entry to `DATASET_REGISTRY` with the dataset's slug, its date field, query mode (`sync` for the inline `query/json` endpoint, `batch` for `query/batch` + job polling), a default event type, default fields, a default lookback window, and a reingest margin (how many days behind real time the dataset's own ingestion lags).
+2. Add a committed `/fields` fixture so the field-inventory validation logic has real data to test against (field names and availability drift across dataset versions). Fetch the live inventory and drop it into [`app/actions/tests/fields_fixtures.py`](app/actions/tests/fields_fixtures.py):
+   ```bash
+   curl -s https://data-api.globalforestwatch.org/dataset/<dataset-slug>/latest/fields | python -m json.tool
+   ```
+3. Run the tests — `test_spec_defaults_exist_in_fields_fixtures` (in `app/actions/tests/test_datasets.py`) fails loudly if the registry references a `date_field`/`lat_field`/`lon_field`/default field that doesn't exist in the fixture, catching allowlist/API drift.
+
+No new handler is needed — the generic pipeline (`action_pull_events` → `action_run_query_job`) drives every dataset in the registry.
+
+## Configuration model
+
+**Auth action** (`action_auth`, portal-visible): `email` + `password` (`SecretStr`) for the GFW Data API account. Credentials feed the token flow; the runner mints an x-api-key from the bearer token.
+
+**Pull action** (`action_pull_events`, portal-visible, scheduled `*/10 * * * *`): `PullEventsConfig` in [`app/actions/configurations.py`](app/actions/configurations.py).
+
+```python
+class PullEventsConfig(PullActionConfiguration):
+    aoi_url: HttpUrl                      # GFW/GNW AOI share link
+    dataset_entries: List[DatasetEntry]
+    force_fetch: bool = False             # bypasses the dataset version gate
+```
+
+Each `DatasetEntry`:
+
+| Field | Meaning |
+|---|---|
+| `dataset` | Key into `DATASET_REGISTRY` |
+| `fields` | Extra fields beyond the dataset's defaults |
+| `filters` | Rows of `{field, operator, value}`, AND'd together; built into a safe, identifier-allowlisted SQL `WHERE` clause |
+| `output` | `{"mode": "per_record"}` — one Event per row, or `{"mode": "h3_grid", "resolution": 4-10}` — rows bucketed into H3 cells, one Event per non-empty cell per run, with `record_count` and per-field min/max/mean in `event_details` |
+| `event_type` | Optional override; defaults to the dataset's `default_event_type` (`_agg` suffix appended in `h3_grid` mode) |
+| `lookback_days` | Optional override of the dataset's default lookback window |
+
+`output` is a Pydantic discriminated union on the `mode` field, which serializes to a JSON-schema `oneOf` (with a `discriminator` block) that react-jsonschema-form renders as a mode dropdown — picking `h3_grid` swaps in the resolution field.
+
+Runtime validation happens at the start of every pull run, per entry: the dataset key must be in the registry, every selected/filtered field must exist in that dataset's live `/fields`, filter fields must be filterable, and filter values must parse to the field's declared type. Invalid entries are logged to the activity log and skipped; the rest of the entries still run (per-entry isolation).
+
+**Internal sub-action**: `action_run_query_job` (`RunQueryJobConfig`, an `InternalActionConfiguration`) is not portal-visible. It's triggered by `action_pull_events` once per (entry, window) slice, and does the actual query → output-strategy → `send_events_to_gundi` work under a shared concurrency semaphore.
+
+### Windows & the reingest margin
+
+Each entry's queried window is `[start, end)` — half-open, so a shared boundary date between two consecutive windows is never queried twice. `end` is always the next UTC midnight; `start` is the entry's stored **window anchor**, clamped in two directions every run:
+
+- Up to `lookback_start` (`end - lookback_days`), so a stuck or ancient anchor can never force a full-lookback re-pull forever.
+- Down to `end - reingest_margin_days`, so even a same-day anchor still re-covers the dataset's ingestion lag — the provider may still be backfilling `end`'s data days after `end` passes.
+
+The effective `start` is persisted as the new anchor *before* any sub-action runs, and `action_run_query_job` only advances the anchor when the window it just finished started exactly at that stored anchor — so a failed or out-of-order slice is safely re-covered next run instead of silently skipped. The tradeoff: records within the reingest margin are re-queried on every run that opens a new dataset version — but a Redis-backed posted-record ledger (per entry, TTL = `reingest_margin_days + 7` days) filters out rows already posted before Events are built, so re-querying the margin no longer means re-posting it. Duplicates in EarthRanger now occur only if the ledger itself is lost (e.g. a Redis flush) or two runs for the same entry race the filter→post→mark check-then-act concurrently (batch polling overlapping a redelivered at-least-once trigger), both of which degrade to today's bounded re-posts rather than ever losing data — at-most-once within the ledger TTL under normal operation, at-least-once overall (never exactly-once). See the design doc's "Event semantics & dedup" section for the ledger's fingerprinting rules (including that two genuinely distinct records identical on every selected field collapse to one post) and the H3-aggregate count implication (`record_count` reflects only new, not-yet-posted records for that run).
+
+**Reference actions** (`action_list_datasets`, `action_list_dataset_fields`) are also not portal-configurable in the usual sense — see below.
+
+## Reference actions & dynamic dropdowns
+
+The dataset picker and field pickers *want* to be portal dropdowns backed by live data, using the reference-actions mechanism vendored from `gundi-integration-cmore` (`ReferenceActionConfiguration`, `gundi:reference` UI annotations, `$data`-bound params). `PullEventsConfig.ui_schema()` wires:
+
+- `dataset_entries[].dataset` → `list_datasets` (no params)
+- `dataset_entries[].fields[]` → `list_dataset_fields`, `dataset` bound via `$data` to the sibling entry's `dataset`
+- `dataset_entries[].filters[].field` → `list_dataset_fields` with `filterable_only: true`
+
+**The Gundi portal does not support the `"reference"` action type yet** (Phase 1 of the cmore RFC is unbuilt). Until it lands:
+- These fields render as plain free-text inputs (`allow_free_text: true` is always set) — users type dataset keys and field names directly, and get validated at runtime with clear activity-log errors on mistakes.
+- Registration of the two reference actions with Gundi is gated behind `REGISTER_REFERENCE_ACTIONS` (env var, **default `False`**), so self-registration never sends an action type the platform would reject. Flip it on once the portal accepts `"reference"` actions — no other integration-side change is needed for the dropdowns to start working.
+
+A drift-guard test (`test_gundi_reference_annotations_match_registered_reference_actions` in `app/actions/tests/test_configurations.py`) asserts every `gundi:reference` annotation names a registered reference action, only declares params that exist on that action's config model, covers all of that model's required params, and never also sets `ui:widget`.
+
+## Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `INTEGRATION_TYPE_NAME` | `Global Nature Watch` | Integration type name shown in the portal |
+| `GNW_DATASET_QUERY_CONCURRENCY` | `5` | Caps concurrent requests to the GFW Data API per instance (module-level `asyncio.Semaphore` in `app/actions/handlers.py`). The API's practical ceiling is ~50 concurrent requests across all instances — size this against instance count. |
+| `REGISTER_REFERENCE_ACTIONS` | `False` | Whether to self-register `list_datasets`/`list_dataset_fields` as `"reference"`-type actions with Gundi. Leave off until the portal supports that action type (see above). |
+
+Set these in the environment or `.env` file the runner loads at startup (see `app/settings/`).
+
+## Running tests
+
+```bash
+pip install -r requirements-base.in -r requirements-dev.in -r requirements.in  # or use the compiled requirements.txt
+pytest
+```
+
+Test layout, by concern:
+- `app/actions/tests/test_gnwclient.py` — Data API client (`respx`-mocked): token/API-key flow, sync query, batch submit/poll/download incl. expired-link refresh, AOI URL parsing.
+- `app/actions/tests/test_handlers.py` — orchestrator and sub-action behavior: quiet-period skip, version-gate skip and `force_fetch` bypass, per-entry error isolation, sync/batch fetch cycles, window anchoring.
+- `app/actions/tests/test_sqlbuilder.py`, `test_output.py`, `test_state.py`, `test_jobs.py`, `test_datasets.py`, `test_configurations.py` — unit tests for the SQL builder, output strategies, state helpers, job seam, dataset registry, and config models (including the reference-action drift guard).
+- `app/actions/tests/test_reference_actions.py` — the two reference actions themselves.
+- `app/actions/tests/test_registration_smoke.py` — end-to-end sanity checks that all five actions register, their portal-facing config schemas serialize, `run_query_job` is internal-only, and `pull_events` carries its crontab schedule.
+- `app/services/tests/` — generic action-runner framework tests inherited from the template.
+
+## Usage (template mechanics)
+- Implement additional actions in `app/actions/handlers.py`.
+- Define configurations needed for actions in `app/actions/configurations.py`.
+- Or implement a webhooks handler in `app/webhooks/handlers.py`, with configurations in `app/webhooks/configurations.py`.
 - Optionally, add the `@activity_logger()` decorator in actions to log common events which you can later see in the portal:
     - Action execution started
     - Action execution complete
