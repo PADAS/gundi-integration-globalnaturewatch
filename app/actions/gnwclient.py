@@ -427,3 +427,113 @@ class DataAPI:
             )
             response.raise_for_status()
             return response.json()
+
+    @backoff.on_exception(backoff.constant, httpx.HTTPError, max_tries=3, interval=10)
+    async def get_aoi(self, aoi_id: str):
+        async with httpx.AsyncClient(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+            response = await client.get(
+                url=f"{self.RESOURCE_WATCH_URL}/v2/area/{aoi_id}",
+                headers=await self.get_auth_header()
+,
+                follow_redirects=True
+            )
+            response.raise_for_status()
+            response = response.json()
+
+            try:
+                return AOIData.parse_obj(response.get("data"))
+            except pydantic.ValidationError as e:
+                logger.exception(f"Unexpected error parsing AOI data: {e}")
+
+            logger.error(
+                "Failed to get AOI for id: %s. result is: %s", aoi_id, response.text[:250]
+            )
+
+            raise GFWClientException(f"Failed to get AOI for id: '{aoi_id}'")
+
+
+    @backoff.on_exception(backoff.constant, httpx.HTTPError, max_tries=3, interval=10)
+    async def get_geostore(self, geostore_id=None):
+        async with httpx.AsyncClient(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+            response = await client.get(
+                url=f"{self.RESOURCE_WATCH_URL}/v2/geostore/{geostore_id}",
+                follow_redirects=True,
+                headers=await self.get_auth_header()
+            )
+            response.raise_for_status()
+            response = response.json()
+
+            try:
+                return Geostore.parse_obj(response.get("data"))
+            except pydantic.ValidationError as e:
+                logger.exception(f"Unexpected error parsing Geostore data: {e}")
+
+            logger.error(
+                "Failed to get Geostore for id: %s. result is: %s", geostore_id, response.text[:250]
+            )
+
+            raise GFWClientException(f"Failed to get Geostore for id: '{geostore_id}'")
+
+
+    @backoff.on_exception(backoff.expo, (httpx.TimeoutException, httpx.HTTPStatusError), max_tries=3, factor=3)
+    async def get_dataset_metadata(self, dataset: str = "", version: str = "latest"):
+
+        api_key = await self.get_a_valid_api_key()
+        headers = {"x-api-key": api_key.api_key}
+
+        async with httpx.AsyncClient(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+            response = await client.get(
+                f"{self.DATA_API_URL}/dataset/{dataset}/{version}",
+                headers=headers,
+                follow_redirects=True
+            )
+
+            if httpx.codes.is_success(response.status_code):
+                data = response.json()
+                return DatasetResponseItem.parse_obj(data.get("data"))
+
+
+    @backoff.on_exception(backoff.constant, httpx.HTTPError, max_tries=3, interval=10)
+    async def aoi_from_url(self, url) -> str:
+        """
+        Extracts the AOI ID from a GFW share link URL.
+        """
+
+        URL_PATTERN = r".*(?:globalforestwatch|globalnaturewatch)\.org.*aoi/([^/]+).*"
+        if matches := re.match(URL_PATTERN, url):
+            return matches[1]
+
+        async with httpx.AsyncClient(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+            head = await client.head(url, follow_redirects=True)
+
+        if matches := re.match(URL_PATTERN, str(head.url)):
+            return matches[1]
+
+        logger.error("Unable to parse AOI from URL: %s (resolved to: %s)", url, head.url)
+        raise GFWClientException(f"Unable to parse AOI from URL: '{url}' (resolved to: '{head.url}')")
+
+
+    @backoff.on_exception(backoff.constant, httpx.HTTPError, max_tries=3, interval=10)
+    async def get_datasets(self):
+        async with httpx.AsyncClient(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+            response = await client.get(
+                f"{self.DATA_API_URL}/datasets",
+                follow_redirects=True
+            )
+            response.raise_for_status()
+            content = response.json()
+            datasets_response = DatasetsResponse.parse_obj(content)
+            return datasets_response.data
+
+    @backoff.on_exception(backoff.constant, httpx.HTTPError, max_tries=3, interval=10)
+    async def get_dataset_fields(self, *, dataset:str, version:str="latest"):
+        async with httpx.AsyncClient(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+            response = await client.get(
+                f"{self.DATA_API_URL}/dataset/{dataset}/{version}/fields",
+                follow_redirects=True
+            )
+            response.raise_for_status()
+            content = response.json()
+            fields_response = DatasetFields.parse_obj(content)
+
+            return fields_response.data
