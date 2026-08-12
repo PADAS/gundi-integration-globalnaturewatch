@@ -1,11 +1,29 @@
+import asyncio
 import logging
+import random
+from datetime import timedelta
 
-from app.actions.configurations import ListDatasetsQuery, ListDatasetFieldsQuery
+import app.settings
+from app.actions.configurations import (
+    ListDatasetsQuery, ListDatasetFieldsQuery, RunQueryJobConfig, entry_state_key, get_auth_config,
+)
 from app.actions.core import ReferenceDataResponse, ReferenceOption
-from app.actions.datasets import DATASET_REGISTRY
-from app.actions.gnwclient import DataAPI
+from app.actions.datasets import DATASET_REGISTRY, QueryMode
+from app.actions.gnwclient import DataAPI, DownloadLinkExpiredException
+from app.actions.jobs import BatchQueryJob, JobState, SyncQueryJob
+from app.actions.output import OUTPUT_STRATEGIES
+from app.actions.sqlbuilder import build_query
+from app.actions.state import GnwState
+from app.services.activity_logger import log_action_activity
+from app.services.gundi import send_events_to_gundi
+from app.services.state import IntegrationStateManager
+from gundi_core.schemas.v2 import Integration, LogLevel
 
 logger = logging.getLogger(__name__)
+
+state_manager = IntegrationStateManager()
+gnw_state = GnwState(state_manager)
+sema = asyncio.Semaphore(app.settings.GNW_DATASET_QUERY_CONCURRENCY)
 
 
 async def action_list_datasets(integration, action_config: ListDatasetsQuery):
@@ -39,3 +57,125 @@ async def action_list_dataset_fields(integration, action_config: ListDatasetFiel
         for f in fields
     ]
     return ReferenceDataResponse(options=options).dict()
+
+
+async def _post_rows(rows, entry, spec, integration_id) -> int:
+    """Shared funnel: rows from any query path -> output strategy -> Gundi Events."""
+    strategy = OUTPUT_STRATEGIES[entry.output.mode]
+    events = strategy.to_events(rows, entry, spec)
+    if events:
+        await send_events_to_gundi(events=events, integration_id=integration_id)
+    return len(events)
+
+
+async def _advance_anchor_contiguously(integration_id, key, window_start: str, window_end: str):
+    """Advance only when this window starts exactly at the stored anchor, so a
+    failed earlier slice is re-covered next run (at-least-once semantics)."""
+    anchor = await gnw_state.get_window_anchor(integration_id, key)
+    if anchor is None or anchor == window_start:
+        await gnw_state.set_window_anchor(integration_id, key, window_end)
+
+
+async def action_run_query_job(integration: Integration, action_config: RunQueryJobConfig):
+    """Internal sub-action: fetch one dataset entry's window (sync or batch)
+    and funnel resulting rows into Gundi Events. Triggered by the pull_events
+    orchestrator (Task 13), one call per (entry, window) slice."""
+    entry = action_config.entry
+    spec = DATASET_REGISTRY[entry.dataset]
+    key = entry_state_key(entry)
+    integration_id = str(integration.id)
+    auth = get_auth_config(integration)
+    client = DataAPI(username=auth.email, password=auth.password.get_secret_value())
+
+    result = {"dataset": entry.dataset, "rows_fetched": 0, "events_posted": 0,
+              "jobs_submitted": 0, "jobs_completed": 0, "jobs_pending": 0, "jobs_failed": 0}
+
+    dataset_fields = await client.get_dataset_fields(dataset=entry.dataset)
+    sql = build_query(
+        spec=spec, extra_fields=entry.fields, filters=[f.dict() for f in entry.filters],
+        window_start=action_config.window_start, window_end=action_config.window_end,
+        dataset_fields=dataset_fields,
+    )
+
+    if spec.query_mode == QueryMode.SYNC:
+        rows = []
+        for geostore_id in action_config.geostore_ids:
+            job = SyncQueryJob(client, dataset=entry.dataset, sql=sql, geostore_id=geostore_id)
+            async with sema:
+                await job.start()
+            rows.extend(job.collect())
+        result["rows_fetched"] = len(rows)
+        result["events_posted"] = await _post_rows(rows, entry, spec, integration_id)
+        await _advance_anchor_contiguously(
+            integration_id, key,
+            action_config.window_start.isoformat(), action_config.window_end.isoformat(),
+        )
+        quiet = random.randint(120, 240) if result["events_posted"] else random.randint(30, 60)
+        await gnw_state.set_quiet_period(integration_id, key, timedelta(minutes=quiet))
+        return result
+
+    # BATCH mode: poll pending jobs first.
+    for job_data in await gnw_state.get_pending_jobs(integration_id, key):
+        job = BatchQueryJob(client, dataset=entry.dataset, sql=sql,
+                            geostore_ids=action_config.geostore_ids)
+        try:
+            state, download_link, message = await job.check(job_data["job_link"])
+            if state == JobState.RESULTS_READY:
+                if message == "partial_success":
+                    await log_action_activity(
+                        integration_id=integration.id, action_id="run_query_job",
+                        level=LogLevel.WARNING,
+                        title=f"Batch job {job_data['job_id']} completed with partial success",
+                        data=job_data)
+                try:
+                    rows = await job.collect(download_link)
+                except DownloadLinkExpiredException as e:
+                    await log_action_activity(
+                        integration_id=integration.id, action_id="run_query_job",
+                        level=LogLevel.ERROR,
+                        title=f"Batch job {job_data['job_id']} download link expired",
+                        data={**job_data, "error": str(e)})
+                    result["jobs_failed"] += 1
+                    await gnw_state.remove_pending_job(integration_id, key, job_data["job_id"])
+                    continue
+                result["rows_fetched"] += len(rows)
+                result["events_posted"] += await _post_rows(rows, entry, spec, integration_id)
+                result["jobs_completed"] += 1
+                await gnw_state.remove_pending_job(integration_id, key, job_data["job_id"])
+                if job_data.get("window_start") and job_data.get("window_end"):
+                    await _advance_anchor_contiguously(
+                        integration_id, key, job_data["window_start"], job_data["window_end"])
+            elif state == JobState.FAILED:
+                await log_action_activity(
+                    integration_id=integration.id, action_id="run_query_job",
+                    level=LogLevel.ERROR,
+                    title=f"Batch job {job_data['job_id']} failed",
+                    data={**job_data, "message": message})
+                result["jobs_failed"] += 1
+                await gnw_state.remove_pending_job(integration_id, key, job_data["job_id"])
+            else:
+                result["jobs_pending"] += 1
+        except Exception:
+            logger.exception(f"Error polling job {job_data.get('job_id')}")
+            result["jobs_pending"] += 1
+
+    if action_config.submit_new:
+        job = BatchQueryJob(client, dataset=entry.dataset, sql=sql,
+                            geostore_ids=action_config.geostore_ids)
+        async with sema:
+            await job.start()
+        await gnw_state.add_pending_job(integration_id, key, {
+            **job.job_record,
+            "window_start": action_config.window_start.isoformat(),
+            "window_end": action_config.window_end.isoformat(),
+        })
+        result["jobs_submitted"] += 1
+
+    if result["jobs_pending"]:
+        quiet_minutes = 0
+    elif result["jobs_submitted"] or result["jobs_completed"]:
+        quiet_minutes = random.randint(240, 720)
+    else:
+        quiet_minutes = random.randint(30, 60)
+    await gnw_state.set_quiet_period(integration_id, key, timedelta(minutes=quiet_minutes))
+    return result
