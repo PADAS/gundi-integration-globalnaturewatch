@@ -102,6 +102,17 @@ class DatasetEntry(pydantic.BaseModel):
     def resolved_lookback_days(self, spec: DatasetSpec) -> int:
         return self.lookback_days or spec.default_lookback_days
 
+    class Config:
+        @staticmethod
+        def schema_extra(schema: dict, model) -> None:
+            # pydantic v1 emits the OpenAPI-only "discriminator" keyword for
+            # the output union. The portal's react-jsonschema-form runs ajv in
+            # strict mode, which refuses to compile schemas with unknown
+            # keywords ("strict mode: unknown keyword: discriminator"), so the
+            # config form cannot validate or save. Strip it from the emitted
+            # schema; runtime parsing still discriminates via the Field.
+            schema.get("properties", {}).get("output", {}).pop("discriminator", None)
+
 
 class PullEventsConfig(PullActionConfiguration):
     aoi_url: pydantic.HttpUrl = pydantic.Field(
@@ -121,14 +132,23 @@ class PullEventsConfig(PullActionConfiguration):
         ui = super().ui_schema()
         items = ui.setdefault("dataset_entries", {}).setdefault("items", {})
         items.setdefault("dataset", {})["gundi:reference"] = _reference("list_datasets")
-        # $data paths: an array and its items count as separate levels (cmore convention)
+        # $data path semantics are ratified by the portal's resolver
+        # (gundi-portal src/components/common/SchemaFormTemplates/referencePath.ts,
+        # resolveDataRef): the start level is the annotated field's CONTAINING
+        # node (for scalar-array items, the array itself — the item index is
+        # the dropped segment), and each "../" climbs exactly one data-path
+        # segment (an array index is its own segment). From a fields[] item,
+        # one climb reaches the DatasetEntry; from filters[].field, two.
+        # NOTE: this differs from the older cmore Phase-0 comment convention
+        # ("array and items are separate levels" → 4 climbs), which the portal
+        # implementation did not adopt.
         items.setdefault("fields", {}).setdefault("items", {})["gundi:reference"] = _reference(
-            "list_dataset_fields", {"dataset": {"$data": "../../dataset"}}
+            "list_dataset_fields", {"dataset": {"$data": "../dataset"}}
         )
         filter_items = items.setdefault("filters", {}).setdefault("items", {})
         filter_items.setdefault("field", {})["gundi:reference"] = _reference(
             "list_dataset_fields",
-            {"dataset": {"$data": "../../../../dataset"}, "filterable_only": True},
+            {"dataset": {"$data": "../../dataset"}, "filterable_only": True},
         )
         return ui
 

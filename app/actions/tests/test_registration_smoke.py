@@ -34,21 +34,34 @@ def test_portal_schemas_serialize():
     assert h3_props["resolution"]["minimum"] == 4
     assert h3_props["resolution"]["maximum"] == 10
 
-    # DatasetEntry.output is a discriminated union (pydantic v1 renders this as
-    # a "oneOf" of $refs plus a "discriminator" block, not "anyOf") — this is
-    # what react-jsonschema-form uses to render the per_record/h3_grid mode
-    # dropdown that swaps in the resolution field.
+    # DatasetEntry.output renders as a "oneOf" of $refs — what
+    # react-jsonschema-form uses for the per_record/h3_grid mode dropdown.
     output_schema = definitions["DatasetEntry"]["properties"]["output"]
-    assert output_schema["discriminator"]["propertyName"] == "mode"
     one_of_refs = {branch["$ref"] for branch in output_schema["oneOf"]}
     assert one_of_refs == {
         "#/definitions/PerRecordOutput",
         "#/definitions/H3GridOutput",
     }
-    assert output_schema["discriminator"]["mapping"] == {
-        "per_record": "#/definitions/PerRecordOutput",
-        "h3_grid": "#/definitions/H3GridOutput",
-    }
+
+    # The OpenAPI "discriminator" keyword pydantic v1 emits for the union must
+    # be stripped EVERYWHERE: the portal's react-jsonschema-form runs ajv in
+    # strict mode, which refuses to compile schemas containing unknown
+    # keywords ("strict mode: unknown keyword: discriminator") and the config
+    # form cannot validate or save. Runtime parsing is unaffected — pydantic
+    # discriminates via the Field, not the emitted schema.
+    def find_keyword(node, keyword):
+        hits = []
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == keyword:
+                    hits.append(v)
+                hits += find_keyword(v, keyword)
+        elif isinstance(node, list):
+            for v in node:
+                hits += find_keyword(v, keyword)
+        return hits
+
+    assert find_keyword(pull_schema, "discriminator") == []
 
 
 def test_run_query_job_is_internal():
