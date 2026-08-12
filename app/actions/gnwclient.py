@@ -9,7 +9,6 @@ import backoff
 from enum import Enum
 from urllib.parse import urlparse, parse_qs
 
-import httpx
 from pydantic import HttpUrl
 from datetime import datetime, timedelta, timezone
 from typing import ClassVar, Optional, List, Set, Tuple, Dict, Any
