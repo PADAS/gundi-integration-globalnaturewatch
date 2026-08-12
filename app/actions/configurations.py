@@ -7,11 +7,33 @@ import pydantic
 
 from app.actions.core import (
     AuthActionConfiguration, ExecutableActionMixin, InternalActionConfiguration,
-    PullActionConfiguration,
+    PullActionConfiguration, ReferenceActionConfiguration,
 )
-from app.actions.datasets import DatasetSpec
+from app.actions.datasets import DATASET_REGISTRY, DatasetSpec
 from app.services.errors import ConfigurationNotFound
 from app.services.utils import find_config_for_action
+
+
+class ListDatasetsQuery(ReferenceActionConfiguration):
+    pass
+
+
+class ListDatasetFieldsQuery(ReferenceActionConfiguration):
+    dataset: str
+    filterable_only: bool = False
+
+    @pydantic.validator("dataset")
+    def dataset_in_registry(cls, v):
+        if v not in DATASET_REGISTRY:
+            raise ValueError(f"Unknown dataset '{v}'. Available: {sorted(DATASET_REGISTRY)}")
+        return v
+
+
+def _reference(action: str, params: Optional[dict] = None) -> dict:
+    """Build a gundi:reference ui_schema annotation (contract vendored from
+    gundi-integration-cmore). Deliberately does NOT set ui:widget — portals
+    without reference support must keep rendering plain text fields."""
+    return {"action": action, "target": "self", "params": params or {}, "allow_free_text": True}
 
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
@@ -93,6 +115,22 @@ class PullEventsConfig(PullActionConfiguration):
         False, title="Force Fetch",
         description="Fetch even if the dataset reports no new data. Use sparingly.",
     )
+
+    @classmethod
+    def ui_schema(cls):
+        ui = super().ui_schema()
+        items = ui.setdefault("dataset_entries", {}).setdefault("items", {})
+        items.setdefault("dataset", {})["gundi:reference"] = _reference("list_datasets")
+        # $data paths: an array and its items count as separate levels (cmore convention)
+        items.setdefault("fields", {}).setdefault("items", {})["gundi:reference"] = _reference(
+            "list_dataset_fields", {"dataset": {"$data": "../../dataset"}}
+        )
+        filter_items = items.setdefault("filters", {}).setdefault("items", {})
+        filter_items.setdefault("field", {})["gundi:reference"] = _reference(
+            "list_dataset_fields",
+            {"dataset": {"$data": "../../../../dataset"}, "filterable_only": True},
+        )
+        return ui
 
 
 class RunQueryJobConfig(InternalActionConfiguration):

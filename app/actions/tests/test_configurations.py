@@ -48,3 +48,34 @@ def test_pull_events_config_parses():
     })
     assert config.dataset_entries[0].dataset == "nasa_viirs_fire_alerts"
     assert config.force_fetch is False
+
+
+def _collect_gundi_references(node, found):
+    if isinstance(node, dict):
+        if "gundi:reference" in node:
+            found.append((node, node["gundi:reference"]))
+        for value in node.values():
+            _collect_gundi_references(value, found)
+
+
+def test_gundi_reference_annotations_match_registered_reference_actions():
+    from app.actions.configurations import PullEventsConfig
+    from app.actions.core import ReferenceActionConfiguration, discover_actions
+
+    handlers = discover_actions(module_name="app.actions.handlers", prefix="action_")
+    found = []
+    _collect_gundi_references(PullEventsConfig.ui_schema(), found)
+
+    assert {ref["action"] for _, ref in found} == {"list_datasets", "list_dataset_fields"}
+    for host_node, ref in found:
+        assert ref["target"] == "self"
+        assert "ui:widget" not in host_node, ref["action"]
+        assert ref["allow_free_text"] is True
+        _, config_model, _ = handlers[ref["action"]]
+        assert issubclass(config_model, ReferenceActionConfiguration)
+        declared = {k for k, v in ref.get("params", {}).items() if not isinstance(v, dict)}
+        data_bound = {k for k, v in ref.get("params", {}).items() if isinstance(v, dict)}
+        model_fields = set(config_model.__fields__)
+        assert (declared | data_bound) <= model_fields
+        required = {n for n, f in config_model.__fields__.items() if f.required}
+        assert required <= (declared | data_bound)
