@@ -32,6 +32,12 @@ def _quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _quote_ident(name: str) -> str:
+    # The Data API parses SQL with pglast (Postgres semantics): unquoted
+    # identifiers fold to lowercase, breaking mixed-case columns like frp__MW.
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _canonical_number(value: str):
     try:
         return str(int(value))
@@ -90,8 +96,9 @@ def build_query(*, spec: DatasetSpec, extra_fields: List[str], filters: List[dic
         if name not in by_name:
             errors.append(f"Unknown field '{name}' for dataset '{spec.title}'")
 
-    clauses = [f"({spec.date_field} >= '{window_start.isoformat()}'"
-               f" AND {spec.date_field} < '{window_end.isoformat()}')"]
+    date_ident = _quote_ident(spec.date_field)
+    clauses = [f"({date_ident} >= '{window_start.isoformat()}'"
+               f" AND {date_ident} < '{window_end.isoformat()}')"]
     for flt in filters:
         field, operator, value = flt["field"], flt["operator"], flt["value"]
         if operator not in VALID_OPERATORS:
@@ -107,13 +114,14 @@ def build_query(*, spec: DatasetSpec, extra_fields: List[str], filters: List[dic
         try:
             if operator == "in":
                 items = [render_literal(v, dataset_field.data_type) for v in value.split(",")]
-                clauses.append(f"{field} IN ({','.join(items)})")
+                clauses.append(f"{_quote_ident(field)} IN ({','.join(items)})")
             else:
-                clauses.append(f"{field} {operator} {render_literal(value, dataset_field.data_type)}")
+                clauses.append(f"{_quote_ident(field)} {operator} {render_literal(value, dataset_field.data_type)}")
         except ConfigValidationError as e:
             errors.append(f"Filter on '{field}': {e.errors[0]}")
 
     if errors:
         raise ConfigValidationError(errors)
 
-    return f"SELECT {','.join(select_fields)} FROM results WHERE {' AND '.join(clauses)}"
+    select_list = ",".join(_quote_ident(name) for name in select_fields)
+    return f"SELECT {select_list} FROM results WHERE {' AND '.join(clauses)}"
