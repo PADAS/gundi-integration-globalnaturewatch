@@ -63,6 +63,7 @@ def stub_state_manager():
     manager.db_client.get = AsyncMock(side_effect=lambda k: store.get(k))
     manager.db_client.set = AsyncMock(side_effect=lambda k, v: store.__setitem__(k, v))
     manager.db_client.exists = AsyncMock(side_effect=lambda k: 1 if k in store else 0)
+    manager.db_client.delete = AsyncMock(side_effect=lambda *keys: sum(store.pop(k, None) is not None for k in keys))
     manager.db_client.smembers = AsyncMock(side_effect=lambda k: store.get(k, set()))
     manager.db_client.srem = AsyncMock(side_effect=lambda k, *m: [store.get(k, set()).discard(x) for x in m] and None)
     manager.db_client.zadd = AsyncMock(side_effect=lambda k, mapping: store.setdefault(k, {}).update(mapping))
@@ -72,5 +73,6 @@ def stub_state_manager():
     manager.db_client.pipeline = MagicMock(side_effect=lambda transaction=True: StubPipeline(store))
     manager.get_state = AsyncMock(return_value=None)
     manager.set_state = AsyncMock()
+    manager.delete_state = AsyncMock()
     manager._store = store
     return manager

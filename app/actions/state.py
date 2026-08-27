@@ -43,6 +43,9 @@ class GnwState:
             return
         await self._db.setex(self._quiet_key(integration_id, entry_key), seconds, "1")
 
+    async def clear_quiet_period(self, integration_id: str, entry_key: str):
+        await self._db.delete(self._quiet_key(integration_id, entry_key))
+
     # --- pending batch jobs (per entry) ---
     def _pending_job_key(self, integration_id: str, entry_key: str, job_id: str) -> str:
         return f"gnw.{integration_id}.{entry_key}.pending_job.{job_id}"
@@ -126,3 +129,6 @@ class GnwState:
 
     async def set_dataset_status(self, integration_id: str, dataset: str, status: dict):
         await self._manager.set_state(integration_id, "pull_events", status, source_id=dataset)
+
+    async def clear_dataset_status(self, integration_id: str, dataset: str):
+        await self._manager.delete_state(integration_id, "pull_events", source_id=dataset)

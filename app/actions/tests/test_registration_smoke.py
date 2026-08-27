@@ -6,13 +6,16 @@ def test_discover_actions_finds_expected_handlers():
     handlers = discover_actions(module_name="app.actions.handlers", prefix="action_")
     assert set(handlers) == {
         "auth", "pull_events", "run_query_job", "list_datasets", "list_dataset_fields",
+        "reset_quiet_periods",
     }
 
 
 def test_portal_schemas_serialize():
     """Every portal-registered config must produce valid JSON schema + ui_schema."""
-    from app.actions.configurations import AuthenticateConfig, PullEventsConfig
-    for model in (AuthenticateConfig, PullEventsConfig):
+    from app.actions.configurations import (
+        AuthenticateConfig, PullEventsConfig, ResetQuietPeriodsConfig,
+    )
+    for model in (AuthenticateConfig, PullEventsConfig, ResetQuietPeriodsConfig):
         schema = json.loads(model.schema_json())
         assert schema["title"]
         assert isinstance(model.ui_schema(), dict)

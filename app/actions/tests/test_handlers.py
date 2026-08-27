@@ -316,6 +316,43 @@ async def test_run_query_job_batch_still_pending_sets_zero_minute_quiet_tier(moc
     assert not await handlers.gnw_state.is_quiet_period(str(integration.id), key)
 
 
+@pytest.mark.asyncio
+async def test_run_query_job_sync_logs_query_result(mocker, handler_env):
+    handlers, send, state_stub, integration = handler_env
+    mocker.patch.object(DataAPI, "query_sync", AsyncMock(return_value=[
+        {"latitude": 1.0, "longitude": 2.0, "alert__date": "2026-08-05",
+         "confidence__cat": "h", "frp__MW": 3.0},
+    ]))
+    config = RunQueryJobConfig(entry=DatasetEntry(dataset="nasa_viirs_fire_alerts"),
+                               geostore_ids=["geo-1"],
+                               window_start=datetime.date(2026, 8, 1),
+                               window_end=datetime.date(2026, 8, 8))
+    await handlers.action_run_query_job(integration, config)
+
+    titles = [c.kwargs["title"] for c in handlers.log_action_activity.await_args_list
+              if c.kwargs.get("title", "").startswith("Queried")]
+    assert titles == [
+        "Queried nasa_viirs_fire_alerts 2026-08-01→2026-08-08: 1 rows fetched, 1 events posted"]
+
+
+@pytest.mark.asyncio
+async def test_run_query_job_batch_logs_job_counts(mocker, handler_env):
+    handlers, send, state_stub, integration = handler_env
+    mocker.patch.object(DataAPI, "query_batch", AsyncMock(return_value=JobResponse.Data(
+        job_id="j1", job_link="https://api.example.com/job/j1", status="pending")))
+    config = RunQueryJobConfig(entry=DatasetEntry(dataset="gfw_integrated_alerts"),
+                               geostore_ids=["geo-1"],
+                               window_start=datetime.date(2026, 7, 9),
+                               window_end=datetime.date(2026, 8, 8), submit_new=True)
+    await handlers.action_run_query_job(integration, config)
+
+    titles = [c.kwargs["title"] for c in handlers.log_action_activity.await_args_list
+              if c.kwargs.get("title", "").startswith("Queried")]
+    assert titles == [
+        "Queried gfw_integrated_alerts 2026-07-09→2026-08-08: 0 rows fetched, 0 events posted;"
+        " jobs: 1 submitted, 0 completed, 0 pending, 0 failed"]
+
+
 def make_aoi_dict(geostore="geo-1"):
     return {"type": "area", "id": "aoi-1", "attributes": {
         "name": "A", "application": "gfw", "geostore": geostore,
@@ -471,6 +508,128 @@ async def test_pull_events_batch_pending_jobs_bypass_quiet(mocker, orchestrator_
     assert trigger.await_count == 1
     sub_config = trigger.call_args.kwargs["config"]
     assert sub_config.submit_new is False
+
+
+def make_pull_config_mock(entries):
+    pull_cfg = MagicMock()
+    pull_cfg.action.value = "pull_events"
+    pull_cfg.data = {
+        "aoi_url": "https://www.globalnaturewatch.org/dashboards/aoi/abc/",
+        "dataset_entries": entries,
+    }
+    return pull_cfg
+
+
+@pytest.mark.asyncio
+async def test_reset_quiet_periods_clears_all_entries(handler_env):
+    handlers, send, state_stub, integration = handler_env
+    from app.actions.configurations import DatasetEntry, ResetQuietPeriodsConfig, entry_state_key
+    from datetime import timedelta
+    integration.configurations.append(make_pull_config_mock([
+        {"dataset": "nasa_viirs_fire_alerts"},
+        {"dataset": "gfw_integrated_alerts"},
+    ]))
+    integration_id = str(integration.id)
+    viirs_key = entry_state_key(DatasetEntry(dataset="nasa_viirs_fire_alerts"))
+    gfw_key = entry_state_key(DatasetEntry(dataset="gfw_integrated_alerts"))
+    await handlers.gnw_state.set_quiet_period(integration_id, viirs_key, timedelta(minutes=60))
+    await handlers.gnw_state.set_quiet_period(integration_id, gfw_key, timedelta(minutes=60))
+
+    result = await handlers.action_reset_quiet_periods(integration, ResetQuietPeriodsConfig())
+
+    assert not await handlers.gnw_state.is_quiet_period(integration_id, viirs_key)
+    assert not await handlers.gnw_state.is_quiet_period(integration_id, gfw_key)
+    # version-gate status cleared too, or the next run would re-skip on "no dataset updates"
+    cleared = {c.kwargs.get("source_id") or c.args[2] for c in state_stub.delete_state.await_args_list}
+    assert cleared == {"nasa_viirs_fire_alerts", "gfw_integrated_alerts"}
+    assert result["reset"] == ["nasa_viirs_fire_alerts", "gfw_integrated_alerts"]
+
+
+@pytest.mark.asyncio
+async def test_reset_quiet_periods_dataset_filter_only_clears_matching(handler_env):
+    handlers, send, state_stub, integration = handler_env
+    from app.actions.configurations import DatasetEntry, ResetQuietPeriodsConfig, entry_state_key
+    from datetime import timedelta
+    integration.configurations.append(make_pull_config_mock([
+        {"dataset": "nasa_viirs_fire_alerts"},
+        {"dataset": "gfw_integrated_alerts"},
+    ]))
+    integration_id = str(integration.id)
+    viirs_key = entry_state_key(DatasetEntry(dataset="nasa_viirs_fire_alerts"))
+    gfw_key = entry_state_key(DatasetEntry(dataset="gfw_integrated_alerts"))
+    await handlers.gnw_state.set_quiet_period(integration_id, viirs_key, timedelta(minutes=60))
+    await handlers.gnw_state.set_quiet_period(integration_id, gfw_key, timedelta(minutes=60))
+
+    result = await handlers.action_reset_quiet_periods(
+        integration, ResetQuietPeriodsConfig(dataset="nasa_viirs_fire_alerts"))
+
+    assert not await handlers.gnw_state.is_quiet_period(integration_id, viirs_key)
+    assert await handlers.gnw_state.is_quiet_period(integration_id, gfw_key)
+    assert result["reset"] == ["nasa_viirs_fire_alerts"]
+
+
+@pytest.mark.asyncio
+async def test_reset_quiet_periods_without_pull_config_reports_message(handler_env):
+    handlers, send, state_stub, integration = handler_env
+    from app.actions.configurations import ResetQuietPeriodsConfig
+
+    result = await handlers.action_reset_quiet_periods(integration, ResetQuietPeriodsConfig())
+
+    assert result["reset"] == []
+    assert "pull" in result["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_reset_quiet_periods_dataset_not_in_config_reports_message(handler_env):
+    handlers, send, state_stub, integration = handler_env
+    from app.actions.configurations import ResetQuietPeriodsConfig
+    integration.configurations.append(make_pull_config_mock([
+        {"dataset": "nasa_viirs_fire_alerts"},
+    ]))
+
+    result = await handlers.action_reset_quiet_periods(
+        integration, ResetQuietPeriodsConfig(dataset="gfw_integrated_alerts"))
+
+    assert result["reset"] == []
+    assert "gfw_integrated_alerts" in result["message"]
+
+
+def summary_titles(log_mock, prefix):
+    return [c.kwargs["title"] for c in log_mock.await_args_list
+            if c.kwargs.get("title", "").startswith(prefix)]
+
+
+@pytest.mark.asyncio
+async def test_pull_events_logs_summary_with_queried_datasets(mocker, orchestrator_env):
+    handlers, trigger, state_stub, integration = orchestrator_env
+    await handlers.gnw_state.set_aoi_data(str(integration.id), make_aoi_dict())
+    from app.actions.configurations import PullEventsConfig
+    config = PullEventsConfig.parse_obj({
+        "aoi_url": "https://www.globalnaturewatch.org/dashboards/aoi/abc/",
+        "dataset_entries": [{"dataset": "nasa_viirs_fire_alerts"}]})
+    await handlers.action_pull_events(integration, config)
+
+    titles = summary_titles(handlers.log_action_activity, "Pull events")
+    assert len(titles) == 1
+    assert "queried: entry[0]:nasa_viirs_fire_alerts" in titles[0]
+
+
+@pytest.mark.asyncio
+async def test_pull_events_logs_summary_with_skip_reason(mocker, orchestrator_env):
+    handlers, trigger, state_stub, integration = orchestrator_env
+    await handlers.gnw_state.set_aoi_data(str(integration.id), make_aoi_dict())
+    from app.actions.configurations import DatasetEntry, PullEventsConfig, entry_state_key
+    from datetime import timedelta
+    entry = DatasetEntry(dataset="nasa_viirs_fire_alerts")
+    await handlers.gnw_state.set_quiet_period(str(integration.id), entry_state_key(entry), timedelta(minutes=30))
+    config = PullEventsConfig.parse_obj({
+        "aoi_url": "https://www.globalnaturewatch.org/dashboards/aoi/abc/",
+        "dataset_entries": [{"dataset": "nasa_viirs_fire_alerts"}]})
+    await handlers.action_pull_events(integration, config)
+
+    titles = summary_titles(handlers.log_action_activity, "Pull events")
+    assert len(titles) == 1
+    assert "skipped: entry[0]:nasa_viirs_fire_alerts (quiet period)" in titles[0]
 
 
 @pytest.mark.asyncio

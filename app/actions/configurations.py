@@ -6,8 +6,8 @@ from typing import List, Literal, Optional, Union
 import pydantic
 
 from app.actions.core import (
-    AuthActionConfiguration, ExecutableActionMixin, InternalActionConfiguration,
-    PullActionConfiguration, ReferenceActionConfiguration,
+    AuthActionConfiguration, ExecutableActionMixin, GenericActionConfiguration,
+    InternalActionConfiguration, PullActionConfiguration, ReferenceActionConfiguration,
 )
 from app.actions.datasets import DATASET_REGISTRY, DatasetSpec
 from app.services.errors import ConfigurationNotFound
@@ -150,6 +150,19 @@ class PullEventsConfig(PullActionConfiguration):
             "list_dataset_fields",
             {"dataset": {"$data": "../../dataset"}, "filterable_only": True},
         )
+        return ui
+
+
+class ResetQuietPeriodsConfig(GenericActionConfiguration, ExecutableActionMixin):
+    dataset: Optional[str] = pydantic.Field(
+        None, title="Dataset",
+        description="Reset only this dataset. Leave blank to reset every configured dataset.",
+    )
+
+    @classmethod
+    def ui_schema(cls):
+        ui = super().ui_schema()
+        ui.setdefault("dataset", {})["gundi:reference"] = _reference("list_datasets")
         return ui
 
 

@@ -25,6 +25,29 @@ async def test_quiet_period(stub_state_manager):
 
 
 @pytest.mark.asyncio
+async def test_clear_quiet_period(stub_state_manager):
+    state = GnwState(stub_state_manager)
+    await state.set_quiet_period("int-1", "abc123", timedelta(minutes=30))
+    await state.clear_quiet_period("int-1", "abc123")
+    assert not await state.is_quiet_period("int-1", "abc123")
+
+
+@pytest.mark.asyncio
+async def test_clear_quiet_period_when_absent_is_noop(stub_state_manager):
+    state = GnwState(stub_state_manager)
+    await state.clear_quiet_period("int-1", "never-set")
+    assert not await state.is_quiet_period("int-1", "never-set")
+
+
+@pytest.mark.asyncio
+async def test_clear_dataset_status(stub_state_manager):
+    state = GnwState(stub_state_manager)
+    await state.clear_dataset_status("int-1", "nasa_viirs_fire_alerts")
+    stub_state_manager.delete_state.assert_awaited_once_with(
+        "int-1", "pull_events", source_id="nasa_viirs_fire_alerts")
+
+
+@pytest.mark.asyncio
 async def test_set_quiet_period_zero_is_noop(stub_state_manager):
     state = GnwState(stub_state_manager)
     await state.set_quiet_period("int-1", "abc123", timedelta(minutes=0))
