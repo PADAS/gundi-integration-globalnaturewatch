@@ -9,7 +9,7 @@ import pydantic
 import app.settings
 from app.actions.configurations import (
     AuthenticateConfig, ListDatasetsQuery, ListDatasetFieldsQuery, PullEventsConfig,
-    RunQueryJobConfig, entry_state_key, get_auth_config,
+    ResetQuietPeriodsConfig, RunQueryJobConfig, entry_state_key, get_auth_config,
 )
 from app.actions.core import ReferenceDataResponse, ReferenceOption
 from app.actions.datasets import DATASET_REGISTRY, QueryMode
@@ -24,6 +24,7 @@ from app.services.action_scheduler import crontab_schedule, trigger_action
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.gundi import send_events_to_gundi
 from app.services.state import IntegrationStateManager
+from app.services.utils import find_config_for_action
 from gundi_core.schemas.v2 import Integration, LogLevel
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,7 @@ async def action_run_query_job(integration: Integration, action_config: RunQuery
         )
         quiet = random.randint(120, 240) if result["events_posted"] else random.randint(30, 60)
         await gnw_state.set_quiet_period(integration_id, key, timedelta(minutes=quiet))
+        await _log_query_result(integration.id, action_config, result, batch=False)
         return result
 
     # BATCH mode: poll pending jobs first. Each phase (check / collect / post /
@@ -227,7 +229,43 @@ async def action_run_query_job(integration: Integration, action_config: RunQuery
     else:
         quiet_minutes = random.randint(30, 60)
     await gnw_state.set_quiet_period(integration_id, key, timedelta(minutes=quiet_minutes))
+    await _log_query_result(integration.id, action_config, result, batch=True)
     return result
+
+
+async def _log_query_result(integration_id, action_config: RunQueryJobConfig, result: dict, *, batch: bool):
+    title = (f"Queried {result['dataset']} "
+             f"{action_config.window_start.isoformat()}→{action_config.window_end.isoformat()}: "
+             f"{result['rows_fetched']} rows fetched, {result['events_posted']} events posted")
+    if batch:
+        title += (f"; jobs: {result['jobs_submitted']} submitted, {result['jobs_completed']} completed, "
+                  f"{result['jobs_pending']} pending, {result['jobs_failed']} failed")
+    await log_action_activity(integration_id=integration_id, action_id="run_query_job",
+                              level=LogLevel.INFO, title=title, data=result)
+
+
+async def action_reset_quiet_periods(integration, action_config: ResetQuietPeriodsConfig):
+    """Executable action: clear the quiet periods and version-gate status for
+    the integration's configured dataset entries, so the next scheduled pull
+    queries fresh instead of skipping. Optionally scoped to one dataset."""
+    integration_id = str(integration.id)
+    pull_config = find_config_for_action(integration.configurations, "pull_events")
+    if not pull_config:
+        return {"reset": [],
+                "message": "This integration has no pull_events configuration to reset."}
+    entries = PullEventsConfig.parse_obj(pull_config.data).dataset_entries
+    if action_config.dataset:
+        entries = [e for e in entries if e.dataset == action_config.dataset]
+        if not entries:
+            return {"reset": [],
+                    "message": f"Dataset '{action_config.dataset}' is not in the pull_events configuration."}
+    reset = []
+    for entry in entries:
+        await gnw_state.clear_quiet_period(integration_id, entry_state_key(entry))
+        await gnw_state.clear_dataset_status(integration_id, entry.dataset)
+        if entry.dataset not in reset:
+            reset.append(entry.dataset)
+    return {"reset": reset}
 
 
 async def action_auth(integration, action_config: AuthenticateConfig):
@@ -367,7 +405,22 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
                                       level=LogLevel.WARNING, title=msg, data={"error": str(e)})
             result["errors"].append(msg)
 
+    await log_action_activity(
+        integration_id=integration.id, action_id="pull_events",
+        level=LogLevel.WARNING if result["errors"] else LogLevel.INFO,
+        title=_pull_events_summary(result), data=result)
     return result
+
+
+def _pull_events_summary(result: dict) -> str:
+    parts = []
+    if result["triggered"]:
+        parts.append(f"queried: {', '.join(result['triggered'])}")
+    if result["skipped"]:
+        parts.append(f"skipped: {', '.join(result['skipped'])}")
+    if result["errors"]:
+        parts.append(f"{len(result['errors'])} error(s)")
+    return "Pull events — " + ("; ".join(parts) if parts else "no datasets configured")
 
 
 def _next_midnight_utc() -> datetime:
