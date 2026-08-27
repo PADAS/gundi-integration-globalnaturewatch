@@ -10,7 +10,7 @@ import datetime
 import math
 from typing import List, Optional
 
-from app.actions.datasets import DatasetSpec
+from app.actions.datasets import DatasetSpec, QueryMode
 from app.actions.gnwclient import DatasetField
 
 VALID_OPERATORS = {"=", "!=", ">", ">=", "<", "<=", "in"}
@@ -114,7 +114,13 @@ def build_query(*, spec: DatasetSpec, extra_fields: List[str], filters: List[dic
         try:
             if operator == "in":
                 items = [render_literal(v, dataset_field.data_type) for v in value.split(",")]
-                clauses.append(f"{_quote_ident(field)} IN ({','.join(items)})")
+                ident = _quote_ident(field)
+                if spec.query_mode == QueryMode.BATCH:
+                    # The batch (raster-analysis) engine's parser has no IN —
+                    # only comparisons plus AND/OR. An equivalent OR chain runs.
+                    clauses.append("(" + " OR ".join(f"{ident} = {item}" for item in items) + ")")
+                else:
+                    clauses.append(f"{ident} IN ({','.join(items)})")
             else:
                 clauses.append(f"{_quote_ident(field)} {operator} {render_literal(value, dataset_field.data_type)}")
         except ConfigValidationError as e:
