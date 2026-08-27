@@ -70,6 +70,24 @@ def test_in_operator_renders_list():
     assert "\"confidence__cat\" IN ('h','n')" in sql
 
 
+def test_in_operator_renders_or_chain_for_batch_dataset():
+    # The batch (raster-analysis) engine's SQL parser supports only
+    # comparison operators plus AND/OR — an IN filter fails every geometry
+    # with "Unsupported filter operator: in".
+    gfw_spec = DATASET_REGISTRY["gfw_integrated_alerts"]
+    fields = make_fields(
+        ("latitude", "numeric", False), ("longitude", "numeric", False),
+        ("gfw_integrated_alerts__date", "date", True),
+        ("gfw_integrated_alerts__confidence", "text", True),
+    )
+    sql = build_query(spec=gfw_spec, extra_fields=[], filters=[
+        {"field": "gfw_integrated_alerts__confidence", "operator": "in", "value": "high, highest"}],
+        window_start=WINDOW[0], window_end=WINDOW[1], dataset_fields=fields)
+    assert ("(\"gfw_integrated_alerts__confidence\" = 'high'"
+            " OR \"gfw_integrated_alerts__confidence\" = 'highest')") in sql
+    assert " IN " not in sql
+
+
 def test_render_literal_types():
     assert render_literal("5.5", "numeric") == "5.5"
     assert render_literal("7", "integer") == "7"
