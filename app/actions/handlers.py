@@ -200,10 +200,12 @@ async def action_run_query_job(integration: Integration, action_config: RunQuery
                     title=f"Batch job {job_id}: cleanup failed after posting; duplicate events possible on next poll",
                     data=job_data)
         elif state == JobState.FAILED:
+            reason = f": {message}" if message else ""
+            logger.error(f"Batch job {job_id} for dataset {entry.dataset} failed{reason}")
             await log_action_activity(
                 integration_id=integration.id, action_id="run_query_job",
                 level=LogLevel.ERROR,
-                title=f"Batch job {job_id} failed",
+                title=f"Batch job {job_id} failed{reason}",
                 data={**job_data, "message": message})
             result["jobs_failed"] += 1
             await gnw_state.remove_pending_job(integration_id, key, job_id)

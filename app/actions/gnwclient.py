@@ -652,6 +652,23 @@ class DataAPI:
                 return JobResponse.parse_obj(data).data
 
     @backoff.on_exception(backoff.expo, (httpx.TimeoutException,), max_tries=3, factor=3)
+    async def get_failed_geometries(self, failed_geometries_link: str) -> Optional[List[dict]]:
+        """Fetch a failed batch job's failed_geometries.json (a signed S3 URL
+        holding [{"fid": ..., "detail": <failure reason>}, ...]).
+
+        Best-effort: returns None on any error — a missing or expired link
+        must never mask the job failure being reported."""
+        try:
+            async with httpx.AsyncClient(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+                response = await client.get(failed_geometries_link, follow_redirects=True)
+                response.raise_for_status()
+                data = response.json()
+                return data if isinstance(data, list) else None
+        except Exception:
+            logger.warning("Could not fetch failed_geometries for a failed batch job",
+                           exc_info=True)
+            return None
+
     async def download_job_results(self, download_link: str) -> List[dict]:
         """
         Download JSON results from a completed batch job's download_link.
