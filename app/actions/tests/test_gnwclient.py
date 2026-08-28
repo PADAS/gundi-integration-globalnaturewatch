@@ -163,6 +163,57 @@ async def test_download_job_results_flattens_and_detects_expiry():
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_download_job_results_retries_on_timeout(fast_backoff):
+    """The retry decorator must stay attached to download_job_results — it was
+    once accidentally displaced onto a method inserted above it."""
+    import httpx
+    respx.post(f"{DataAPI.DATA_API_URL}/auth/token").respond(json=TOKEN_PAYLOAD)
+    respx.get(f"{DataAPI.DATA_API_URL}/auth/apikeys").respond(json={"data": [api_key_item()]})
+    respx.get("https://storage.example.com/results.json").mock(
+        side_effect=[httpx.TimeoutException("slow"),
+                     httpx.Response(200, json=[{"result": [{"latitude": 1.0}], "fid": "a"}])]
+    )
+    client = DataAPI(username="u", password="p")
+    rows = await client.download_job_results("https://storage.example.com/results.json")
+    assert rows == [{"latitude": 1.0}]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_failed_geometries_does_not_retry():
+    """Best-effort fetch: a timeout returns None immediately, no backoff."""
+    import httpx
+    route = respx.get("https://storage.example.com/failed_geometries.json").mock(
+        side_effect=httpx.TimeoutException("slow"))
+    client = DataAPI(username="u", password="p")
+    result = await client.get_failed_geometries("https://storage.example.com/failed_geometries.json")
+    assert result is None
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_failed_geometries_returns_details():
+    respx.get("https://storage.example.com/failed_geometries.json").respond(
+        json=[{"fid": "abc", "detail": "Unsupported filter operator: in"}]
+    )
+    client = DataAPI(username="u", password="p")
+    result = await client.get_failed_geometries("https://storage.example.com/failed_geometries.json")
+    assert result == [{"fid": "abc", "detail": "Unsupported filter operator: in"}]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_failed_geometries_tolerates_errors():
+    """A missing/expired link must not mask the job failure itself."""
+    respx.get("https://storage.example.com/failed_geometries.json").respond(status_code=403)
+    client = DataAPI(username="u", password="p")
+    result = await client.get_failed_geometries("https://storage.example.com/failed_geometries.json")
+    assert result is None
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_get_dataset_metadata_raises_on_500(fast_backoff):
     respx.post(f"{DataAPI.DATA_API_URL}/auth/token").respond(json=TOKEN_PAYLOAD)
     respx.get(f"{DataAPI.DATA_API_URL}/auth/apikeys").respond(json={"data": [api_key_item()]})

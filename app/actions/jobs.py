@@ -66,7 +66,17 @@ class BatchQueryJob:
                 "partial_success" if status.status == "partial_success" else None
             )
         if status.status == "failed":
-            return JobState.FAILED, None, status.message
+            message = status.message
+            if not message and status.failed_geometries_link:
+                # GFW usually leaves message null on failure; the per-geometry
+                # reasons live in the failed_geometries.json the job links to.
+                details = await self._client.get_failed_geometries(
+                    str(status.failed_geometries_link))
+                if details:
+                    message = "; ".join(dict.fromkeys(
+                        str(d["detail"]) for d in details
+                        if isinstance(d, dict) and d.get("detail"))) or None
+            return JobState.FAILED, None, message
         return JobState.PENDING, None, None
 
     async def collect(self, download_link: str) -> List[dict]:

@@ -233,6 +233,35 @@ async def test_run_query_job_batch_failed_job_marks_failed_and_clears_pending(mo
 
 
 @pytest.mark.asyncio
+async def test_run_query_job_batch_failed_job_logs_reason(mocker, caplog, handler_env):
+    """The failure reason must reach BOTH the activity-log title and the GCP
+    (Cloud Run) logs — previously neither carried it, so a failed job left no
+    clues anywhere."""
+    import logging
+    handlers, send, state_stub, integration = handler_env
+    from app.actions.configurations import entry_state_key
+    entry = DatasetEntry(dataset="gfw_integrated_alerts")
+    key = entry_state_key(entry)
+    await handlers.gnw_state.add_pending_job(str(integration.id), key, {
+        "job_id": "j1", "job_link": "https://api.example.com/job/j1",
+        "window_start": "2026-07-09", "window_end": "2026-08-08"})
+    mocker.patch.object(DataAPI, "get_job_status", AsyncMock(return_value=JobResponse.Data(
+        job_id="j1", status="failed", message="Unsupported filter operator: in")))
+
+    config = RunQueryJobConfig(entry=entry, geostore_ids=["geo-1"],
+                               window_start=datetime.date(2026, 7, 9),
+                               window_end=datetime.date(2026, 8, 8), submit_new=False)
+    with caplog.at_level(logging.ERROR, logger="app.actions.handlers"):
+        await handlers.action_run_query_job(integration, config)
+
+    titles = [c.kwargs["title"] for c in handlers.log_action_activity.await_args_list
+              if c.kwargs.get("title", "").startswith("Batch job")]
+    assert titles == ["Batch job j1 failed: Unsupported filter operator: in"]
+    assert any("j1" in r.message and "Unsupported filter operator: in" in r.message
+               for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_run_query_job_batch_expired_download_link_stays_pending(mocker, handler_env):
     """An expired download link is transient: the next poll returns a freshly
     signed link, so the job must remain pending (bounded by the record TTL),
