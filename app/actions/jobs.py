@@ -74,7 +74,8 @@ class BatchQueryJob:
                     str(status.failed_geometries_link))
                 if details:
                     message = "; ".join(dict.fromkeys(
-                        d["detail"] for d in details if d.get("detail"))) or None
+                        str(d["detail"]) for d in details
+                        if isinstance(d, dict) and d.get("detail"))) or None
             return JobState.FAILED, None, message
         return JobState.PENDING, None, None
 

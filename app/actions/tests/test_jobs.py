@@ -97,6 +97,25 @@ async def test_batch_job_failed_with_message_does_not_fetch_geometries():
 
 
 @pytest.mark.asyncio
+async def test_batch_job_failed_geometries_tolerates_malformed_items():
+    from app.actions.gnwclient import JobResponse
+    client = MagicMock()
+    client.get_job_status = AsyncMock(return_value=JobResponse.Data(
+        job_id="j1", status="failed", message=None,
+        failed_geometries_link="https://s3.example.com/failed_geometries.json"))
+    client.get_failed_geometries = AsyncMock(return_value=[
+        {"fid": "a", "detail": "Unsupported filter operator: in"},
+        "garbage-string-item",
+        {"fid": "b", "detail": 123},
+        {"fid": "c"},
+    ])
+    job = BatchQueryJob(client, dataset="d", sql="SELECT ...", geostore_ids=["g1"])
+    state, _, message = await job.check("https://api.example.com/job/j1")
+    assert state == JobState.FAILED
+    assert message == "Unsupported filter operator: in; 123"
+
+
+@pytest.mark.asyncio
 async def test_batch_job_failed_geometries_unavailable_keeps_null_message():
     from app.actions.gnwclient import JobResponse
     client = MagicMock()

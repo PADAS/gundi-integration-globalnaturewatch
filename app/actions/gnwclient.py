@@ -651,7 +651,6 @@ class DataAPI:
                 data = response.json()
                 return JobResponse.parse_obj(data).data
 
-    @backoff.on_exception(backoff.expo, (httpx.TimeoutException,), max_tries=3, factor=3)
     async def get_failed_geometries(self, failed_geometries_link: str) -> Optional[List[dict]]:
         """Fetch a failed batch job's failed_geometries.json (a signed S3 URL
         holding [{"fid": ..., "detail": <failure reason>}, ...]).
@@ -669,6 +668,7 @@ class DataAPI:
                            exc_info=True)
             return None
 
+    @backoff.on_exception(backoff.expo, (httpx.TimeoutException,), max_tries=3, factor=3)
     async def download_job_results(self, download_link: str) -> List[dict]:
         """
         Download JSON results from a completed batch job's download_link.
