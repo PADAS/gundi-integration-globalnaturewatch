@@ -100,7 +100,7 @@ The dataset picker and field pickers *want* to be portal dropdowns backed by liv
 
 **The Gundi portal does not support the `"reference"` action type yet** (Phase 1 of the cmore RFC is unbuilt). Until it lands:
 - These fields render as plain free-text inputs (`allow_free_text: true` is always set) — users type dataset keys and field names directly, and get validated at runtime with clear activity-log errors on mistakes.
-- Registration of the two reference actions with Gundi is gated behind `REGISTER_REFERENCE_ACTIONS` (env var, **default `False`**), so self-registration never sends an action type the platform would reject. Flip it on once the portal accepts `"reference"` actions — no other integration-side change is needed for the dropdowns to start working.
+- The two reference actions self-register with Gundi as `"reference"`-type actions. The platform accepts that type, so there is nothing to turn on; the `REGISTER_REFERENCE_ACTIONS` flag that used to gate this is gone.
 
 A drift-guard test (`test_gundi_reference_annotations_match_registered_reference_actions` in `app/actions/tests/test_configurations.py`) asserts every `gundi:reference` annotation names a registered reference action, only declares params that exist on that action's config model, covers all of that model's required params, and never also sets `ui:widget`.
 
@@ -110,7 +110,6 @@ A drift-guard test (`test_gundi_reference_annotations_match_registered_reference
 |---|---|---|
 | `INTEGRATION_TYPE_NAME` | `Global Nature Watch` | Integration type name shown in the portal |
 | `GNW_DATASET_QUERY_CONCURRENCY` | `5` | Caps concurrent requests to the GFW Data API per instance (module-level `asyncio.Semaphore` in `app/actions/handlers.py`). The API's practical ceiling is ~50 concurrent requests across all instances — size this against instance count. |
-| `REGISTER_REFERENCE_ACTIONS` | `False` | Whether to self-register `list_datasets`/`list_dataset_fields` as `"reference"`-type actions with Gundi. Leave off until the portal supports that action type (see above). |
 
 Set these in the environment or `.env` file the runner loads at startup (see `app/settings/`).
 
