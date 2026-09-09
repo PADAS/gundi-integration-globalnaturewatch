@@ -763,69 +763,6 @@ def test_discover_actions_ignores_functions_without_action_config():
     assert list(handlers.keys()) == ["pull_observations"]
 
 
-@pytest.fixture
-def mock_action_handlers_with_reference(mock_action_handlers):
-    from app.actions.core import ReferenceActionConfiguration
-
-    class ListThingsQuery(ReferenceActionConfiguration):
-        pass
-
-    async def action_list_things(integration, action_config: ListThingsQuery):
-        return {"options": []}
-
-    handlers = dict(mock_action_handlers)
-    handlers["list_things"] = (action_list_things, ListThingsQuery, None)
-    return handlers
-
-
-@pytest.mark.asyncio
-async def test_reference_actions_not_registered_while_flag_off(
-    mocker,
-    mock_gundi_client_v2,
-    mock_action_handlers_with_reference,
-    mock_get_webhook_handler_for_fixed_json_payload,
-):
-    """With REGISTER_REFERENCE_ACTIONS=False (default), reference actions are
-    omitted from the registration payload entirely."""
-    mocker.patch("app.services.self_registration.INTEGRATION_TYPE_SLUG", "x_tracker")
-    mocker.patch(
-        "app.services.self_registration.action_handlers", mock_action_handlers_with_reference
-    )
-    mocker.patch(
-        "app.services.self_registration.get_webhook_handler",
-        mock_get_webhook_handler_for_fixed_json_payload,
-    )
-    await register_integration_in_gundi(gundi_client=mock_gundi_client_v2)
-    data = mock_gundi_client_v2.register_integration_type.call_args.args[0]
-    assert all(a["type"] != "reference" for a in data["actions"])
-    assert all(a["value"] != "list_things" for a in data["actions"])
-
-
-@pytest.mark.asyncio
-async def test_reference_actions_registered_with_reference_type_when_enabled(
-    mocker,
-    mock_gundi_client_v2,
-    mock_action_handlers_with_reference,
-    mock_get_webhook_handler_for_fixed_json_payload,
-):
-    """With REGISTER_REFERENCE_ACTIONS=True, reference actions register with
-    type 'reference' and are not treated as periodic actions."""
-    mocker.patch("app.services.self_registration.INTEGRATION_TYPE_SLUG", "x_tracker")
-    mocker.patch("app.services.self_registration.REGISTER_REFERENCE_ACTIONS", True)
-    mocker.patch(
-        "app.services.self_registration.action_handlers", mock_action_handlers_with_reference
-    )
-    mocker.patch(
-        "app.services.self_registration.get_webhook_handler",
-        mock_get_webhook_handler_for_fixed_json_payload,
-    )
-    await register_integration_in_gundi(gundi_client=mock_gundi_client_v2)
-    data = mock_gundi_client_v2.register_integration_type.call_args.args[0]
-    action = next(a for a in data["actions"] if a["value"] == "list_things")
-    assert action["type"] == "reference"
-    assert action["is_periodic_action"] is False
-
-
 @pytest.mark.asyncio
 async def test_crontab_schedule_decorator(
         mocker, mock_publish_event, integration_v2, pull_observations_config
@@ -847,3 +784,41 @@ async def test_crontab_schedule_decorator(
         tz_offset=0
     )
     assert action_pull_observations.crontab_schedule == expected_schedule
+
+
+def test_action_type_enum_has_reference():
+    from app.services.core import ActionTypeEnum
+
+    assert ActionTypeEnum.REFERENCE.value == "reference"
+
+
+def _dummy_reference_handlers():
+    from app.actions.core import ReferenceActionConfiguration
+
+    class DummyQuery(ReferenceActionConfiguration):
+        pass
+
+    async def action_list_dummy(integration, action_config: DummyQuery):
+        return {"options": []}
+
+    return {"list_dummy": (action_list_dummy, DummyQuery, None)}
+
+
+@pytest.mark.asyncio
+async def test_reference_actions_are_registered_with_the_reference_type(mocker):
+    # The platform accepts the "reference" action type, so reference actions
+    # always register, and with their own type rather than "generic" (which
+    # the runner's ephemeral whitelist would otherwise be the only guard for).
+    from unittest.mock import AsyncMock, MagicMock
+    from app.services import self_registration
+
+    mocker.patch.object(self_registration, "action_handlers", _dummy_reference_handlers())
+    gundi_client = MagicMock()
+    gundi_client.register_integration_type = AsyncMock(return_value={})
+
+    await self_registration.register_integration_in_gundi(gundi_client, type_slug="my_tracker")
+
+    data = gundi_client.register_integration_type.call_args.args[0]
+    assert [a["value"] for a in data["actions"]] == ["list_dummy"]
+    assert data["actions"][0]["type"] == "reference"
+    assert data["actions"][0]["is_periodic_action"] is False

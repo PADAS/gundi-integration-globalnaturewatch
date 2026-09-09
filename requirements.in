@@ -1,3 +1,11 @@
 backoff~=2.2.1
-httpx~=0.24.1
+# httpx is pinned in requirements-base.in (the template declares it because
+# app/services imports it directly, and gundi-client-v2 3.x requires the 0.28
+# line). Declaring it here as well meant every template bump of it landed as a
+# resolver conflict on sync; this connector's use is plain AsyncClient/Timeout/
+# error types, which 0.28 keeps.
 h3~=4.1
+# respx is imported by this connector's client tests. gundi-client-v2 2.4 used to
+# pull it in transitively; 3.x does not, and 0.22 is the first release that
+# supports the httpx 0.28 line.
+respx~=0.22.0

@@ -66,12 +66,19 @@ class ReferenceActionConfiguration(ActionConfiguration):
 
     Reference actions are stateless — they read the integration's auth config
     but store no configuration of their own; callers (the Gundi portal)
-    supply query params via config_overrides. They return a
-    ReferenceDataResponse dict.
+    supply query params via config_overrides. The runner therefore executes
+    them without a stored config row, and they are one of the two action
+    types (with auth) allowed to run ephemerally against a draft integration.
     """
 
 
 class ReferenceOption(BaseModel):
+    """One choice in a reference-data response.
+
+    The shape the Gundi portal renders a dropdown from. `value` is what gets
+    stored in the integration's configuration; everything else is presentation.
+    """
+
     value: str
     label: Optional[str] = None        # portal defaults label to value
     description: Optional[str] = None  # tooltip / help text
@@ -79,6 +86,14 @@ class ReferenceOption(BaseModel):
 
 
 class ReferenceDataResponse(BaseModel):
+    """What a reference action returns, as a dict.
+
+    Handlers return `ReferenceDataResponse(...).dict()`: the runner publishes
+    the handler's return value as-is, and the portal reads these three fields.
+    `truncated` tells it the provider had more than the handler was willing to
+    return, so the list is a prefix rather than the whole set.
+    """
+
     options: List[ReferenceOption]
     cache_ttl_seconds: int = 300       # portal-side cache hint
     truncated: bool = False            # true if the list was capped
