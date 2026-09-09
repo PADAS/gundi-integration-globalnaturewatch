@@ -136,3 +136,6 @@ dmypy.json
 .vscode
 
 sample-docs
+
+# git worktrees for feature branches
+.worktrees/
