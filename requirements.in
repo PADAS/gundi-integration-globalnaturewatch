@@ -12,3 +12,5 @@ respx~=0.22.0
 # Driver for the patch store (app/actions/patches_store). [binary] bundles libpq,
 # so the image needs no system packages for it.
 psycopg[binary]~=3.2
+# Migrations for the patch store (app/actions/patches_store/migrations).
+alembic~=1.14
