@@ -209,3 +209,195 @@ def test_property_versions_only_increase_and_cells_are_owned_once():
             last_version[change.patch_id] = change.version
         open_cells = [c for p in patches.values() if p.status == OPEN for c in p.pixels]
         assert len(open_cells) == len(set(open_cells))
+
+
+# --- The same cell disturbed again after the reuse window ---------------------
+
+X = (5, 5)
+
+
+def _closed_then_open_on_one_cell():
+    """Cell X in a closed day-1 patch and again in an open day-200 patch."""
+    patches, _ = run([(1, px([X], 1)), (40, []), (200, px([X], 200))])
+    assert sorted((p.status, p.pixels[X].alert_date) for p in patches.values()) == [
+        (CLOSED, day(1)), (OPEN, day(200))]
+    return patches
+
+
+def test_replaying_an_old_observation_leaves_the_newer_patch_alone():
+    patches = _closed_then_open_on_one_cell()
+
+    result = apply_batch(patches, px([X], 1), today=day(200))
+
+    assert result.changes == []
+    assert partition(result.patches) == partition(patches)
+    assert sorted(p.pixels[X].alert_date for p in result.patches.values()) == [day(1), day(200)]
+
+
+def test_replaying_an_old_observation_when_both_patches_are_closed_adds_nothing():
+    patches = _closed_then_open_on_one_cell()
+    patches = apply_batch(patches, [], today=day(240)).patches
+    assert [p.status for p in patches.values()] == [CLOSED, CLOSED]
+
+    result = apply_batch(patches, px([X], 1) + px([X], 200), today=day(240))
+
+    assert result.changes == []
+    assert len(result.patches) == 2
+
+
+def test_an_old_observation_improves_the_occurrence_it_belongs_to():
+    patches = _closed_then_open_on_one_cell()
+
+    result = apply_batch(patches, px([X], 1, confidence=3), today=day(200))
+
+    by_date = {p.pixels[X].alert_date: p for p in result.patches.values()}
+    assert by_date[day(1)].max_confidence == 3
+    assert by_date[day(200)].max_confidence == 1
+    assert [c.kinds for c in result.changes] == [("confidence_changed",)]
+
+
+def test_an_unseen_old_observation_does_not_overwrite_a_newer_pixel():
+    # Only the day-200 patch is known; the day-1 alert arrives late.
+    patches, _ = run([(200, px([X], 200))])
+
+    result = apply_batch(patches, px([X], 1), today=day(200))
+
+    assert sorted((p.status, p.pixels[X].alert_date) for p in result.patches.values()) == [
+        (CLOSED, day(1)), (OPEN, day(200))]
+    again = apply_batch(result.patches, px([X], 1), today=day(200))
+    assert again.changes == []
+
+
+def test_one_batch_keeps_two_disturbances_of_a_cell_apart():
+    pixels = px([X], 1) + px([X], 200)
+
+    one_batch, _ = run([(200, pixels)])
+    daily, _ = run([(1, px([X], 1)), (40, []), (200, px([X], 200))])
+
+    assert sorted((p.status, p.pixels[X].alert_date) for p in one_batch.values()) == [
+        (CLOSED, day(1)), (OPEN, day(200))]
+    assert partition(one_batch) == partition(daily)
+
+
+def test_one_batch_still_collapses_dates_inside_the_reuse_window():
+    # Days 1 and 100 are one disturbance; day 250 is another.
+    patches, _ = run([(250, px([X], 100, confidence=2) + px([X], 1) + px([X], 250))])
+
+    assert sorted((p.pixels[X].alert_date, p.max_confidence) for p in patches.values()) == [
+        (day(1), 2), (day(250), 1)]
+
+
+def test_dates_in_one_batch_are_split_by_what_is_already_stored():
+    # Day 178 is the stored day-1 disturbance seen again; day 181 is past the
+    # reuse window, so it is a new one, though the two are 3 days apart.
+    patches, _ = run([(1, px([X], 1)), (40, [])])
+
+    together = apply_batch(patches, px([X], 178, confidence=2) + px([X], 181), today=day(181))
+    apart, _ = run([(1, px([X], 1)), (40, []), (178, px([X], 178, confidence=2)),
+                    (181, px([X], 181))])
+
+    assert sorted((p.status, p.pixels[X].alert_date, p.max_confidence)
+                  for p in together.patches.values()) == [(CLOSED, day(1), 2), (OPEN, day(181), 1)]
+    assert _states(together.patches) == _states(apart)
+
+
+def test_a_cell_disturbed_again_inside_a_long_lived_patch_stays_in_it():
+    # The patch grows by one cell every 20 days, so it is still open on day
+    # 200 when X is disturbed again.
+    history = [(1, px([X], 1))]
+    history += [(n, px([(5, 6 + i)], n)) for i, n in enumerate(range(21, 201, 20))]
+    history += [(200, px([X], 200))]
+    daily, _ = run(history)
+    one_batch, _ = run([(200, [p for _, batch in history for p in batch])])
+
+    for patches in (daily, one_batch):
+        assert len(patches) == 1
+        (patch,) = patches.values()
+        assert patch.status == OPEN
+        assert patch.pixels[X].alert_date == day(200)
+        # The patch still began on day 1, though no pixel carries that date.
+        assert patch.first_alert == day(1)
+
+    # The day-1 alert was replaced, so seeing it again changes nothing, even
+    # once the patch has closed.
+    assert apply_batch(daily, px([X], 1), today=day(200)).changes == []
+    closed = apply_batch(daily, [], today=day(260)).patches
+    assert apply_batch(closed, px([X], 1), today=day(260)).changes == []
+
+
+def _long_history(rng, days=420, size=5, events=90):
+    """Sparse alerts on a small grid over more than two reuse windows, so
+    cells are disturbed again after long gaps."""
+    history = {}
+    for _ in range(events):
+        n = rng.randint(1, days)
+        history.setdefault(n, []).append(
+            Pixel(rng.randrange(size), rng.randrange(size), day(n), rng.randint(1, 3)))
+    return history
+
+
+def _states(patches):
+    """Comparable view that tells two disturbances of one cell apart."""
+    return sorted(
+        (p.status, tuple(sorted((cell, px_.alert_date, px_.confidence)
+                                for cell, px_ in p.pixels.items())))
+        for p in patches.values() if p.status in (OPEN, CLOSED))
+
+
+def test_property_long_history_gives_the_same_patches_however_it_is_batched():
+    rng = random.Random(23)
+    all_params = (Params(), Params(window_days=10), Params(window_days=60, adjacency_k=2),
+                  Params(reuse_days=90))
+    for round_ in range(60):
+        params = all_params[round_ % len(all_params)]
+        history = _long_history(rng)
+        last = max(history)
+        daily, _ = run([(n, history.get(n, [])) for n in range(1, last + 1)], params=params)
+
+        everything = [p for n in sorted(history) for p in history[n]]
+        rng.shuffle(everything)
+        one_batch, _ = run([(last, everything)], params=params)
+        weekly, _ = run(
+            [(min(n + 6, last), [p for d in range(n, n + 7) for p in history.get(d, [])])
+             for n in range(1, last + 1, 7)], params=params)
+
+        assert _states(one_batch) == _states(daily)
+        assert _states(weekly) == _states(daily)
+
+
+def test_property_long_history_seeing_stored_pixels_again_is_a_noop():
+    # Every pixel the patches still hold, closed patches included, offered
+    # again in one batch. A cell held twice is offered with both its dates.
+    rng = random.Random(29)
+    for _ in range(40):
+        history = _long_history(rng)
+        last = max(history)
+        patches, _ = run([(n, history.get(n, [])) for n in range(1, last + 1)])
+        stored = [p for patch in patches.values() if patch.status in (OPEN, CLOSED)
+                  for p in patch.pixels.values()]
+        assert len({p.cell for p in stored}) < len(stored)  # some cell is held twice
+        rng.shuffle(stored)
+
+        replay = apply_batch(patches, stored, today=day(last))
+
+        assert replay.changes == []
+        assert _states(replay.patches) == _states(patches)
+
+
+def test_a_sighting_between_a_replaced_date_and_its_replacement_moves_the_date_earlier():
+    # Known limit: a patch keeps one pixel per cell. Once day 253 replaced
+    # day 43 here, the patch no longer knows that day 196 belonged to the
+    # day-43 disturbance, so seeing day 196 again reads as the day-253 alert
+    # moving earlier. GNW's raster holds one date per pixel, so this takes a
+    # replay of several raster versions at once.
+    history = [(43, px([X], 43))]
+    history += [(n, px([(5, 6 + i)], n)) for i, n in enumerate(range(60, 260, 20))]
+    history += [(196, px([X], 196)), (253, px([X], 253))]
+    patches, _ = run(sorted(history))
+    (patch,) = patches.values()
+    assert patch.pixels[X].alert_date == day(253)
+
+    result = apply_batch(patches, px([X], 43) + px([X], 196), today=day(253))
+
+    assert result.patches[patch.patch_id].pixels[X].alert_date == day(196)
+    assert [c.kinds for c in result.changes] == [("grown",)]

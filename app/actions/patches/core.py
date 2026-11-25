@@ -22,6 +22,17 @@ order of a batch does not matter, and replaying history one day at a time
 gives the same patches as one large batch. A pixel that arrives late, with a
 date earlier than pixels already processed, is placed best-effort.
 
+One cell can be disturbed more than once. Observations of a cell less than
+`reuse_days` apart are the same disturbance (earliest date, highest
+confidence); further apart they are separate ones, each matched by date to
+the patch that holds it. So a cell can sit in a closed patch and again in a
+newer one, and re-fetching either observation changes nothing.
+
+A patch keeps one pixel per cell. A cell disturbed again inside a patch that
+is still open replaces its older pixel there, and the older date is then
+forgotten: a sighting dated between the two, seen again later, is read as
+the newer alert's date moving earlier.
+
 NOT here yet (open decisions in the design doc): the patch size cap and
 split rule, and the emission threshold (a delivery concern).
 """
@@ -78,12 +89,20 @@ class Patch:
     def pixel_count(self) -> int:
         return len(self.pixels)
 
-    def refresh(self) -> None:
-        """Recompute aggregates. An emptied patch keeps its last known values."""
+    def refresh(self, shrunk: bool = False) -> None:
+        """Recompute aggregates. An emptied patch keeps its last known values.
+
+        `first_alert` is when the patch began. It does not move later when a
+        cell's pixel is replaced by a newer disturbance, only when pixels
+        are withdrawn (`shrunk`).
+        """
         if not self.pixels:
             return
         dates = [p.alert_date for p in self.pixels.values()]
-        self.first_alert, self.last_alert = min(dates), max(dates)
+        first = min(dates)
+        if self.first_alert is not None and not shrunk:
+            first = min(first, self.first_alert)
+        self.first_alert, self.last_alert = first, max(dates)
         self.max_confidence = max(p.confidence for p in self.pixels.values())
 
 
@@ -121,17 +140,17 @@ class _UnionFind:
             self._parent[rb] = ra
 
 
-def _collapse(batch: Iterable[Pixel]) -> Dict[Cell, Pixel]:
-    """One pixel per cell: earliest date, highest confidence."""
-    by_cell: Dict[Cell, Pixel] = {}
+def _dedupe(batch: Iterable[Pixel]) -> List[Pixel]:
+    """One pixel per cell and alert date, with the highest confidence seen,
+    in (alert_date, row, col) order. Dates of one cell are not merged here:
+    whether two dates are one disturbance depends on what is already stored."""
+    best: Dict[Tuple[date, int, int], Pixel] = {}
     for p in batch:
-        seen = by_cell.get(p.cell)
-        if seen is None:
-            by_cell[p.cell] = p
-        else:
-            by_cell[p.cell] = Pixel(p.row, p.col, min(seen.alert_date, p.alert_date),
-                                    max(seen.confidence, p.confidence))
-    return by_cell
+        key = (p.alert_date, p.row, p.col)
+        seen = best.get(key)
+        if seen is None or seen.confidence < p.confidence:
+            best[key] = p
+    return [best[key] for key in sorted(best)]
 
 
 def apply_batch(
@@ -171,21 +190,38 @@ def apply_batch(
         work[pid] = clone
 
     kinds: Dict[str, Set[str]] = {}
-    owner: Dict[Cell, str] = {}
+    # Every patch holding a pixel on a cell. A cell disturbed again long
+    # after a closed patch sits in that patch and in a newer one.
+    holders: Dict[Cell, List[str]] = {}
     for pid, patch in work.items():
         if patch.status in (OPEN, CLOSED):
-            for cell, pixel in patch.pixels.items():
-                # A cell disturbed again long after a closed patch can sit in
-                # two patches; the most recent one owns it.
-                held = owner.get(cell)
-                if held is None or work[held].pixels[cell].alert_date < pixel.alert_date:
-                    owner[cell] = pid
+            for cell in patch.pixels:
+                holders.setdefault(cell, []).append(pid)
 
-    incoming = _collapse(batch)
+    def spans(patch: Patch, d: date) -> bool:
+        return patch.first_alert - window <= d <= patch.last_alert + window
+
+    def joinable(patch: Patch, d: date) -> bool:
+        return patch.status == OPEN and spans(patch, d)
+
+    def hold(patch: Patch, pixel: Pixel) -> None:
+        """Put a pixel in a patch, unless the patch already has a newer one
+        on that cell."""
+        cell = pixel.cell
+        had = patch.pixels.get(cell)
+        if had is None:
+            holders.setdefault(cell, []).append(patch.patch_id)
+        elif had.alert_date > pixel.alert_date:
+            return
+        patch.pixels[cell] = pixel
+
+    observed = _dedupe(batch)
+    incoming = {p.cell for p in observed}
 
     # 1. Withdrawals.
     if withdraw_from is not None:
-        for pid in sorted(set(owner.values()), key=lambda i: work[i].created_order):
+        live = [pid for pid, patch in work.items() if patch.status in (OPEN, CLOSED)]
+        for pid in sorted(live, key=lambda i: work[i].created_order):
             patch = work[pid]
             gone = [c for c, p in patch.pixels.items()
                     if p.alert_date >= withdraw_from and c not in incoming]
@@ -193,46 +229,67 @@ def apply_batch(
                 continue
             for cell in gone:
                 del patch.pixels[cell]
-                if owner.get(cell) == pid:
-                    del owner[cell]
+                holders[cell].remove(pid)
             if patch.pixels:
-                patch.refresh()
+                patch.refresh(shrunk=True)
                 kinds.setdefault(pid, set()).add("shrunk")
             else:
                 patch.status = WITHDRAWN
                 kinds.setdefault(pid, set()).add("withdrawn")
 
     # 2. Reconcile pixels we already hold; what is left is new.
+    # Observations go oldest first, so each one meets every disturbance of
+    # its cell that is older: those stored, and those new in this batch.
     fresh: Dict[date, Dict[Cell, Pixel]] = {}
-    for cell, p in incoming.items():
-        pid = owner.get(cell)
-        if pid is None:
-            fresh.setdefault(p.alert_date, {})[cell] = p
-            continue
-        patch = work[pid]
-        stored = patch.pixels[cell]
-        if abs((p.alert_date - stored.alert_date).days) < params.reuse_days:
+    for p in observed:
+        cell = p.cell
+        held = [(work[pid], work[pid].pixels[cell]) for pid in holders.get(cell, ())]
+        new = [(None, fresh[d][cell]) for d in fresh if cell in fresh[d]]
+
+        def gap(h, p=p) -> int:
+            return abs((p.alert_date - h[1].alert_date).days)
+
+        same = [h for h in held + new if gap(h) < params.reuse_days]
+        if same:
+            # A disturbance we already know, whichever patch has it. It is
+            # the latest one that began on or before this date; failing
+            # that, this is an earlier sighting of the next one to begin.
+            # Nearest-in-date would be wrong: seen again, a late sighting of
+            # an old disturbance would move to a newer one that began just
+            # after it.
+            began_before = [h for h in same if h[1].alert_date <= p.alert_date]
+            order = lambda h: (h[1].alert_date, h[0].created_order if h[0] else -1)  # noqa: E731
+            patch, stored = (max(began_before, key=order) if began_before
+                             else min(same, key=order))
             merged = Pixel(p.row, p.col, min(stored.alert_date, p.alert_date),
                            max(stored.confidence, p.confidence))
-        elif patch.status == OPEN:
-            merged = p  # same cell disturbed again inside a long-lived patch
+            if patch is None:
+                # New in this batch too, and older: only confidence can rise.
+                fresh[stored.alert_date][cell] = merged
+                continue
         else:
-            # A new disturbance on a cell of a closed patch: it can seed or
-            # join another patch. The closed patch keeps its old pixel.
-            fresh.setdefault(p.alert_date, {})[cell] = p
-            continue
+            # A disturbance we do not hold.
+            if any(spans(h[0], p.alert_date) and h[1].alert_date > p.alert_date for h in held):
+                # A patch that was alive on this date has since taken a
+                # newer pixel on the cell, which replaced this one.
+                continue
+            alive = [h for h in held if joinable(h[0], p.alert_date)]
+            if not alive:
+                # It can seed or join another patch; patches holding the
+                # cell keep their own pixel.
+                fresh.setdefault(p.alert_date, {})[cell] = p
+                continue
+            # Same cell disturbed again inside a long-lived patch.
+            patch, stored = max(alive, key=lambda h: (h[1].alert_date, -h[0].created_order))
+            merged = p
         if merged == stored:
             continue
         patch.pixels[cell] = merged
         patch.refresh()
-        kinds.setdefault(pid, set()).add(
+        kinds.setdefault(patch.patch_id, set()).add(
             "confidence_changed" if merged.alert_date == stored.alert_date else "grown")
 
     # 3. Group new pixels, oldest date first.
-    def joinable(patch: Patch, d: date) -> bool:
-        return (patch.status == OPEN
-                and patch.first_alert - window <= d <= patch.last_alert + window)
-
     for d in sorted(fresh):
         cells = fresh[d]
         uf = _UnionFind()
@@ -242,15 +299,15 @@ def apply_batch(
             r, c = cell
             for dr in range(-k, k + 1):
                 for dc in range(-k, k + 1):
-                    if dr == 0 and dc == 0:
-                        continue
+                    # The cell itself counts: a patch alive on this date that
+                    # holds an older pixel here takes the new one.
                     near = (r + dr, c + dc)
-                    if near in cells:
+                    if near != cell and near in cells:
                         uf.union(("c", cell), ("c", near))
-                    pid = owner.get(near)
-                    if pid is not None and joinable(work[pid], d):
-                        uf.union(("c", cell), ("p", pid))
-                        touched.add(pid)
+                    for pid in holders.get(near, ()):
+                        if joinable(work[pid], d):
+                            uf.union(("c", cell), ("p", pid))
+                            touched.add(pid)
 
         members: Dict[object, Tuple[List[Cell], Set[str]]] = {}
         for cell in sorted(cells):
@@ -272,15 +329,14 @@ def apply_batch(
                 for other_id in ordered[1:]:
                     other = work[other_id]
                     for cell, p in other.pixels.items():
-                        target.pixels[cell] = p
-                        owner[cell] = target.patch_id
+                        holders[cell].remove(other_id)
+                        hold(target, p)
                     other.pixels = {}
                     other.status = MERGED
                     other.merged_into = target.patch_id
                     kinds.setdefault(other_id, set()).add("merged")
             for cell in new_cells:
-                target.pixels[cell] = cells[cell]
-                owner[cell] = target.patch_id
+                hold(target, cells[cell])
             target.refresh()
 
     # 4. Close patches that have gone quiet.
