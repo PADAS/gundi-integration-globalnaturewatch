@@ -7,6 +7,21 @@ jobs:
     # Pinned: pyjq 2.6.0 has no wheel and its bundled oniguruma does not
     # compile with the gcc on ubuntu-26.04, which ubuntu-latest now means.
     runs-on: ubuntu-24.04
+    services:
+      # Scratch database for the patch store tests (app/actions/patches_store).
+      # Same major version as the pipeline Cloud SQL instances.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: gnw_patches_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout branch
         uses: actions/checkout@v4
@@ -24,4 +39,6 @@ jobs:
       - name: Install dependencies
         run: pip install --no-cache-dir -r requirements.txt
       - name: Run unit tests
+        env:
+          GNW_PATCHES_TEST_DB_URL: postgresql://postgres:test@localhost:5432/gnw_patches_test
         run: pytest

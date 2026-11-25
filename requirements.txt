@@ -98,6 +98,10 @@ pluggy==1.5.0
     # via pytest
 prometheus-client==0.20.0
     # via gcloud-aio-pubsub
+psycopg[binary]==3.3.9
+    # via -r requirements.in
+psycopg-binary==3.3.9
+    # via psycopg
 pycparser==2.22
     # via cffi
 pydantic==1.10.17
@@ -143,6 +147,7 @@ typing-extensions==4.12.2
     # via
     #   exceptiongroup
     #   fastapi
+    #   psycopg
     #   pydantic
     #   uvicorn
 uvicorn==0.23.2
