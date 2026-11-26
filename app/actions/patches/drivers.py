@@ -19,7 +19,7 @@ class DriverSummary:
 def summarise(
     classes: Iterable[Optional[Hashable]],
     *,
-    priority_of: Optional[Callable[[Hashable], int]] = None,
+    priority_of: Optional[Callable[[Hashable], Optional[int]]] = None,
     unlabeled: Iterable[Hashable] = (),
 ) -> DriverSummary:
     """Majority driver of a patch, one entry of `classes` per pixel.
@@ -28,6 +28,11 @@ def summarise(
     to the class with the higher `priority_of`, so a tie never hides the more
     serious driver; a tie that remains is broken by the class key so the
     result does not depend on pixel order.
+
+    `priority_of` may answer None for a class it does not know (`dict.get`
+    does); such a class ranks below every class that has a priority. Pass
+    `EventConfig.priority_for` to rank classes by the same priorities, with
+    the connection's overrides, that the event will carry.
     """
     skip = set(unlabeled)
     total = 0
@@ -39,8 +44,13 @@ def summarise(
     labelled = sum(counts.values())
     if not labelled:
         return DriverSummary(driver=None, share=None, labelled=0, total=total)
-    rank = priority_of or (lambda _cls: 0)
-    driver = min(counts, key=lambda cls: (-counts[cls], -rank(cls), str(cls)))
+
+    def order(cls):
+        priority = priority_of(cls) if priority_of else None
+        known = priority is not None
+        return (-counts[cls], not known, -priority if known else 0, str(cls))
+
+    driver = min(counts, key=order)
     return DriverSummary(
         driver=driver, share=counts[driver] / labelled, labelled=labelled, total=total,
     )

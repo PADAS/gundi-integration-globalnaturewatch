@@ -51,6 +51,7 @@ def test_create_payload_for_a_patch_outside_drivers_coverage():
         "last_alert": "2026-07-12",
         "pixel_count": 6,
         "area_ha": 0.07,
+        "in_aoi_area_ha": None,
         "max_confidence": "high",
         "driver_status": "not_covered",
         "driver": None,
@@ -111,12 +112,44 @@ def test_priority_override_wins_and_unknown_class_gets_the_default():
 
 @pytest.mark.parametrize("kwargs", [
     {"default_priority": 150},
-    {"default_priority": None},
+    {"default_priority": 200.0},     # serialises as 200.0, which the API refuses
+    {"default_priority": False},     # equals 0, serialises as false
+    {"default_priority": "200"},
     {"driver_priority_overrides": {"mining": 250}},
+    {"driver_priority_overrides": {"mining": None}},
+    {"driver_priority_overrides": {"mining": True}},
 ])
 def test_config_rejects_a_priority_gundi_would_refuse(kwargs):
     with pytest.raises(ValueError):
         EventConfig(**kwargs)
+
+
+def test_no_default_priority_leaves_the_priority_to_the_destination():
+    config = EventConfig(default_priority=None)
+    patch = make_patch(block(2, 2))
+
+    # No driver, or a class with no priority of its own: the field is left
+    # out, on create and on update, so EarthRanger's event type decides.
+    assert "priority" not in create_payload(patch, config)
+    assert "priority" not in update_payload(patch, config)
+    assert "priority" not in update_payload(patch, config, labelled("a_class_gnw_adds_later"))
+    # A driver with a priority still sets it. 0 is a real priority, not "unset".
+    assert update_payload(patch, config, labelled("mining"))["priority"] == 300
+    zero = EventConfig(default_priority=None, driver_priority_overrides={"wildfire": 0})
+    assert update_payload(patch, zero, labelled("wildfire"))["priority"] == 0
+
+
+def test_config_keeps_its_own_copy_of_the_overrides():
+    overrides = {"wildfire": 300}
+    config = EventConfig(driver_priority_overrides=overrides)
+    overrides["wildfire"] = 100
+    overrides["mining"] = 0
+
+    assert config.priority_for("wildfire") == 300
+    assert config.priority_for("mining") == 300
+    with pytest.raises(TypeError):
+        config.driver_priority_overrides["mining"] = 0
+    assert EventConfig().driver_priority_overrides == {}
 
 
 @pytest.mark.parametrize("status, expected", [
@@ -126,12 +159,53 @@ def test_event_status(status, expected):
     assert event_status(make_patch(block(1, 1), status=status)) == expected
 
 
+def emptied(status, merged_into=None):
+    """A patch as the core leaves it once merged or fully withdrawn: no
+    pixels, with the dates and confidence it last had."""
+    patch = make_patch(block(1, 2), status=status, merged_into=merged_into)
+    patch.pixels = {}
+    return patch
+
+
 def test_merged_patch_is_resolved_and_points_at_the_survivor():
-    patch = make_patch(block(1, 2), status=MERGED, merged_into="patch-0")
-    update = update_payload(patch)
+    update = update_payload(emptied(MERGED, merged_into="patch-0"), driver=labelled("mining"))
     assert update["status"] == "resolved"
+    assert update["title"] == "Forest disturbance: merged into another patch"
     assert update["event_details"]["patch_status"] == "merged"
     assert update["event_details"]["merged_into"] == "patch-0"
+
+
+def test_resolving_an_event_does_not_report_a_size_of_zero():
+    for status, title in ((MERGED, "Forest disturbance: merged into another patch"),
+                          (WITHDRAWN, "Forest disturbance: alert withdrawn")):
+        update = update_payload(emptied(status), EventConfig(include_geometry=True))
+        details = update["event_details"]
+
+        assert update["title"] == title
+        # The patch has no pixels left, which is not the same as a size of
+        # zero: the size is left out, not overwritten.
+        assert "pixel_count" not in details
+        assert "area_ha" not in details
+        assert "geometry" not in update
+        # What the patch last knew is still reported.
+        assert details["first_alert"] == "2026-07-01"
+        assert details["last_alert"] == "2026-07-12"
+        assert details["max_confidence"] == "high"
+
+
+def test_event_time_stays_where_it_was_created_when_the_first_alert_moves():
+    patch = make_patch(block(2, 2))
+    created = create_payload(patch)
+    assert created["recorded_at"] == "2026-07-01T00:00:00+00:00"
+
+    # An earlier sighting moves the patch's first alert back.
+    cell = block(2, 2)[1]
+    patch.pixels[cell] = Pixel(cell[0], cell[1], date(2026, 6, 20), 2)
+    patch.refresh()
+    update = update_payload(patch)
+
+    assert "recorded_at" not in update
+    assert update["event_details"]["first_alert"] == "2026-06-20"
 
 
 def test_update_payload_never_moves_the_event_in_time_or_place():
@@ -148,9 +222,11 @@ def test_update_is_the_same_fields_the_create_carried():
     assert update == {k: created[k] for k in update}
 
 
-def test_in_aoi_area_is_reported_only_when_known():
+def test_in_aoi_area_is_always_sent_and_null_when_unknown():
     patch = make_patch(block(2, 2))
-    assert "in_aoi_area_ha" not in create_payload(patch)["event_details"]
+    # Always present, so an update that no longer knows it clears the old value.
+    assert create_payload(patch)["event_details"]["in_aoi_area_ha"] is None
+    assert update_payload(patch)["event_details"]["in_aoi_area_ha"] is None
     event = create_payload(patch, in_aoi_area_m2=patch_area_m2(patch) / 2)
     assert event["event_details"]["in_aoi_area_ha"] == pytest.approx(0.02, abs=0.01)
 
@@ -161,13 +237,31 @@ def test_patch_without_pixels_cannot_be_created():
         create_payload(patch)
 
 
+@pytest.mark.parametrize("status", [MERGED, WITHDRAWN])
+def test_a_patch_resolved_before_its_first_delivery_cannot_be_created(status):
+    # It kept its first alert date but has nothing left to show.
+    with pytest.raises(ValueError, match="no pixels"):
+        create_payload(emptied(status))
+
+
 def test_withdrawn_patch_that_lost_all_pixels_still_updates():
-    patch = make_patch(block(1, 1), status=WITHDRAWN)
-    patch.pixels = {}
-    update = update_payload(patch)
+    update = update_payload(emptied(WITHDRAWN))
     assert update["status"] == "resolved"
-    assert update["event_details"]["pixel_count"] == 0
+    assert update["event_details"]["patch_status"] == "withdrawn"
     assert update["event_details"]["first_alert"] == "2026-07-01"
+
+
+def test_a_different_grid_changes_the_whole_payload_not_part_of_it():
+    patch = make_patch(block(2, 2))
+    half = EventConfig(cells_per_degree=5_000, include_geometry=True)
+    event = create_payload(patch, half)
+
+    lat, lon = cell_center(ROW, COL, 5_000)
+    assert event["location"] == {"lat": round(lat, 5), "lon": round(lon, 5)}
+    area_ha = patch_area_m2(patch, 5_000) / 10_000
+    assert event["event_details"]["area_ha"] == round(area_ha, 2)
+    assert event["title"] == f"Forest disturbance, {round(area_ha, 2):g} ha"
+    assert event["geometry"] == patch_hull(patch, 5_000)
 
 
 def test_area_is_latitude_corrected():

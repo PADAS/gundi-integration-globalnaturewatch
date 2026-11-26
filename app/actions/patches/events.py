@@ -12,6 +12,7 @@ Spec: "EarthRanger mapping". Still unconfirmed and therefore conservative:
 """
 from dataclasses import dataclass, field
 from datetime import datetime, time, timezone
+from types import MappingProxyType
 from typing import Dict, List, Mapping, Optional, Tuple
 
 from .core import MERGED, WITHDRAWN, Patch
@@ -42,24 +43,38 @@ LABELLED, PENDING, NOT_COVERED = "labelled", "pending", "not_covered"
 
 
 def _check_priority(value: int, what: str) -> None:
-    if value not in PRIORITIES:
+    # Exactly an int: 200.0 and False pass a plain membership test but
+    # serialise as 200.0 and false, which the API refuses.
+    if type(value) is not int or value not in PRIORITIES:
         raise ValueError(f"{what} must be one of {PRIORITIES}, got {value!r}")
 
 
 @dataclass(frozen=True)
 class EventConfig:
-    """Per-connection choices that shape the event."""
-    default_priority: int = 200
+    """Per-connection choices that shape the event.
+
+    `default_priority` applies to a patch with no driver, or with a driver
+    class that has no priority of its own. None leaves the priority out of
+    the event, so the destination's event type decides it. 0 is a priority
+    like any other, not "unset".
+    """
+    default_priority: Optional[int] = 200
     driver_priority_overrides: Mapping[str, int] = field(default_factory=dict)
     event_type: str = EVENT_TYPE
     include_geometry: bool = False
+    cells_per_degree: int = CELLS_PER_DEGREE
 
     def __post_init__(self):
-        _check_priority(self.default_priority, "default_priority")
+        if self.default_priority is not None:
+            _check_priority(self.default_priority, "default_priority")
         for driver, value in self.driver_priority_overrides.items():
             _check_priority(value, f"priority override for {driver!r}")
+        # A private, read-only copy: the caller's dict can change later, and
+        # one config is shared as the default argument of the payload builders.
+        object.__setattr__(self, "driver_priority_overrides",
+                           MappingProxyType(dict(self.driver_priority_overrides)))
 
-    def priority_for(self, driver: Optional[str]) -> int:
+    def priority_for(self, driver: Optional[str]) -> Optional[int]:
         if driver is None:
             return self.default_priority
         if driver in self.driver_priority_overrides:
@@ -152,8 +167,18 @@ def _driver_label(driver: str) -> str:
     return driver.replace("_", " ")
 
 
-def event_title(patch: Patch, driver: DriverInfo = NO_DRIVER) -> str:
-    area = f"{_hectares(patch_area_m2(patch)):g} ha"
+def event_title(
+    patch: Patch, driver: DriverInfo = NO_DRIVER, *, area_m2: Optional[float] = None,
+) -> str:
+    """Title of the event. A merged or withdrawn patch has no pixels left, so
+    its title says what became of it, not a size of zero."""
+    if patch.status == MERGED:
+        return "Forest disturbance: merged into another patch"
+    if patch.status == WITHDRAWN:
+        return "Forest disturbance: alert withdrawn"
+    if area_m2 is None:
+        area_m2 = patch_area_m2(patch)
+    area = f"{_hectares(area_m2):g} ha"
     if driver.status == LABELLED:
         return f"Forest disturbance: {_driver_label(driver.driver)}, {area}"
     if driver.status == PENDING:
@@ -163,14 +188,23 @@ def event_title(patch: Patch, driver: DriverInfo = NO_DRIVER) -> str:
 
 def event_details(
     patch: Patch, driver: DriverInfo = NO_DRIVER, *, in_aoi_area_m2: Optional[float] = None,
+    area_m2: Optional[float] = None,
 ) -> dict:
+    """Details of the event. Every key is always present, null when unknown,
+    so an update replaces what an earlier one said. The exception is the
+    size of a patch with no pixels left (merged or withdrawn): `pixel_count`
+    and `area_ha` are left out, because it has no size to report and zero
+    would overwrite the last real one."""
+    if area_m2 is None:
+        area_m2 = patch_area_m2(patch)
+    size = {"pixel_count": patch.pixel_count, "area_ha": _hectares(area_m2)} if patch.pixels else {}
     details = {
         "patch_id": patch.patch_id,
         "patch_status": patch.status,
         "first_alert": patch.first_alert.isoformat() if patch.first_alert else None,
         "last_alert": patch.last_alert.isoformat() if patch.last_alert else None,
-        "pixel_count": patch.pixel_count,
-        "area_ha": _hectares(patch_area_m2(patch)),
+        **size,
+        "in_aoi_area_ha": _hectares(in_aoi_area_m2) if in_aoi_area_m2 is not None else None,
         "max_confidence": CONFIDENCE_LABEL.get(patch.max_confidence),
         "driver_status": driver.status,
         "driver": driver.driver,
@@ -182,20 +216,22 @@ def event_details(
         "driver_source": driver.source if driver.covered else None,
         "merged_into": patch.merged_into,
     }
-    if in_aoi_area_m2 is not None:
-        details["in_aoi_area_ha"] = _hectares(in_aoi_area_m2)
     return details
 
 
 def _changeable_fields(patch, config, driver, in_aoi_area_m2) -> dict:
+    area_m2 = patch_area_m2(patch, config.cells_per_degree)
     fields = {
-        "title": event_title(patch, driver),
+        "title": event_title(patch, driver, area_m2=area_m2),
         "status": event_status(patch),
-        "priority": config.priority_for(driver.driver),
-        "event_details": event_details(patch, driver, in_aoi_area_m2=in_aoi_area_m2),
+        "event_details": event_details(
+            patch, driver, in_aoi_area_m2=in_aoi_area_m2, area_m2=area_m2),
     }
+    priority = config.priority_for(driver.driver)
+    if priority is not None:
+        fields["priority"] = priority
     if config.include_geometry:
-        hull = patch_hull(patch)
+        hull = patch_hull(patch, config.cells_per_degree)
         if hull is not None:
             fields["geometry"] = hull
     return fields
@@ -208,10 +244,15 @@ def create_payload(
     *,
     in_aoi_area_m2: Optional[float] = None,
 ) -> dict:
-    """The event to post the first time a patch is delivered."""
-    if patch.first_alert is None:
+    """The event to post the first time a patch is delivered.
+
+    Raises ValueError for a patch with no pixels. That includes one merged
+    or withdrawn before it was ever delivered: there is nothing to show, so
+    delivery skips it instead of creating an event that is already resolved.
+    """
+    if not patch.pixels or patch.first_alert is None:
         raise ValueError(f"Patch {patch.patch_id} has no pixels to report")
-    lat, lon = cell_center(*patch.seed)
+    lat, lon = cell_center(*patch.seed, config.cells_per_degree)
     recorded_at = datetime.combine(patch.first_alert, time.min, tzinfo=timezone.utc)
     return {
         "event_type": config.event_type,
@@ -230,6 +271,11 @@ def update_payload(
     in_aoi_area_m2: Optional[float] = None,
 ) -> dict:
     """The fields to send on every update: the patch's whole current state,
-    never a diff, so an update is safe to repeat and safe to skip. Time and
-    location are left out; they are fixed when the event is created."""
+    never a diff, so an update is safe to repeat and safe to skip.
+
+    Time and location are left out on purpose: they are fixed when the event
+    is created. A patch's first alert can still move, earlier when an older
+    sighting arrives or a merge absorbs an older patch, so the event's time
+    can differ from `event_details.first_alert`, which is always current.
+    """
     return _changeable_fields(patch, config, driver, in_aoi_area_m2)
